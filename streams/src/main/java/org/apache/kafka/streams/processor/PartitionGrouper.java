@@ -19,35 +19,20 @@ package org.apache.kafka.streams.processor;
 
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.streams.processor.internals.KafkaStreamingPartitionAssignor;
 
 import java.util.Map;
 import java.util.Set;
 
-public abstract class PartitionGrouper {
-
-    protected Map<Integer, Set<String>> topicGroups;
-
-    private KafkaStreamingPartitionAssignor partitionAssignor = null;
+public interface PartitionGrouper {
 
     /**
-     * Returns a map of task ids to groups of partitions.
+     * Returns a map of task ids to groups of partitions. A partition group forms a task, thus, partitions that are
+     * expected to be processed together must be in the same group. DefaultPartitionGrouper implements this
+     * interface. See {@link DefaultPartitionGrouper} for more information.
      *
-     * @param metadata
+     * @param topicGroups The map from the {@link TopologyBuilder#topicGroups() topic group} id to topics
+     * @param metadata Metadata of the consuming cluster
      * @return a map of task ids to groups of partitions
      */
-    public abstract Map<TaskId, Set<TopicPartition>> partitionGroups(Cluster metadata);
-
-    public void topicGroups(Map<Integer, Set<String>> topicGroups) {
-        this.topicGroups = topicGroups;
-    }
-
-    public void partitionAssignor(KafkaStreamingPartitionAssignor partitionAssignor) {
-        this.partitionAssignor = partitionAssignor;
-    }
-
-    public Set<TaskId> taskIds(TopicPartition partition) {
-        return partitionAssignor.taskIds(partition);
-    }
-
+    Map<TaskId, Set<TopicPartition>> partitionGroups(Map<Integer, Set<String>> topicGroups, Cluster metadata);
 }

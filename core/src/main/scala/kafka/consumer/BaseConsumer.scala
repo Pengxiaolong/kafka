@@ -18,6 +18,12 @@
 package kafka.consumer
 
 import java.util.Properties
+import java.util.regex.Pattern
+
+import kafka.common.StreamEndException
+import kafka.message.Message
+import org.apache.kafka.clients.consumer.internals.NoOpConsumerRebalanceListener
+import org.apache.kafka.common.record.TimestampType
 
 /**
  * A base consumer used to abstract both old and new consumer
@@ -31,15 +37,27 @@ trait BaseConsumer {
   def commit()
 }
 
-case class BaseConsumerRecord(topic: String, partition: Int, offset: Long, key: Array[Byte], value: Array[Byte])
+case class BaseConsumerRecord(topic: String,
+                              partition: Int,
+                              offset: Long,
+                              timestamp: Long = Message.NoTimestamp,
+                              timestampType: TimestampType = TimestampType.NO_TIMESTAMP_TYPE,
+                              key: Array[Byte],
+                              value: Array[Byte])
 
-class NewShinyConsumer(topic: String, consumerProps: Properties, val timeoutMs: Long = Long.MaxValue) extends BaseConsumer {
+class NewShinyConsumer(topic: Option[String], whitelist: Option[String], consumerProps: Properties, val timeoutMs: Long = Long.MaxValue) extends BaseConsumer {
   import org.apache.kafka.clients.consumer.KafkaConsumer
 
-import scala.collection.JavaConversions._
+  import scala.collection.JavaConversions._
 
   val consumer = new KafkaConsumer[Array[Byte], Array[Byte]](consumerProps)
-  consumer.subscribe(List(topic))
+  if (topic.isDefined)
+    consumer.subscribe(List(topic.get))
+  else if (whitelist.isDefined)
+    consumer.subscribe(Pattern.compile(whitelist.get), new NoOpConsumerRebalanceListener())
+  else
+    throw new IllegalArgumentException("Exactly one of topic or whitelist has to be provided.")
+
   var recordIter = consumer.poll(0).iterator
 
   override def receive(): BaseConsumerRecord = {
@@ -50,7 +68,13 @@ import scala.collection.JavaConversions._
     }
 
     val record = recordIter.next
-    BaseConsumerRecord(record.topic, record.partition, record.offset, record.key, record.value)
+    BaseConsumerRecord(record.topic,
+                       record.partition,
+                       record.offset,
+                       record.timestamp,
+                       record.timestampType,
+                       record.key,
+                       record.value)
   }
 
   override def stop() {
@@ -75,9 +99,17 @@ class OldConsumer(topicFilter: TopicFilter, consumerProps: Properties) extends B
   val iter = stream.iterator
 
   override def receive(): BaseConsumerRecord = {
-    // we do not need to check hasNext for KafkaStream iterator
+    if (!iter.hasNext())
+      throw new StreamEndException
+
     val messageAndMetadata = iter.next
-    BaseConsumerRecord(messageAndMetadata.topic, messageAndMetadata.partition, messageAndMetadata.offset, messageAndMetadata.key, messageAndMetadata.message)
+    BaseConsumerRecord(messageAndMetadata.topic,
+                       messageAndMetadata.partition,
+                       messageAndMetadata.offset,
+                       messageAndMetadata.timestamp,
+                       messageAndMetadata.timestampType,
+                       messageAndMetadata.key,
+                       messageAndMetadata.message)
   }
 
   override def stop() {

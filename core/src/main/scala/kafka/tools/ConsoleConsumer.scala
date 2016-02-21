@@ -18,14 +18,19 @@
 package kafka.tools
 
 import java.io.PrintStream
+import java.util.concurrent.CountDownLatch
 import java.util.{Properties, Random}
 import joptsimple._
+import kafka.common.StreamEndException
 import kafka.consumer._
 import kafka.message._
 import kafka.metrics.KafkaMetricsReporter
 import kafka.utils._
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.common.errors.WakeupException
+import org.apache.kafka.common.record.TimestampType
 import org.apache.kafka.common.utils.Utils
+import org.apache.log4j.Logger
 
 import scala.collection.JavaConversions._
 
@@ -35,6 +40,8 @@ import scala.collection.JavaConversions._
 object ConsoleConsumer extends Logging {
 
   var messageCount = 0
+
+  private val shutdownLatch = new CountDownLatch(1)
 
   def main(args: Array[String]) {
     val conf = new ConsumerConfig(args)
@@ -52,7 +59,7 @@ object ConsoleConsumer extends Logging {
     val consumer =
       if (conf.useNewConsumer) {
         val timeoutMs = if (conf.timeoutMs >= 0) conf.timeoutMs else Long.MaxValue
-        new NewShinyConsumer(conf.topicArg, getNewConsumerProps(conf), timeoutMs)
+        new NewShinyConsumer(Option(conf.topicArg), Option(conf.whitelistArg), getNewConsumerProps(conf), timeoutMs)
       } else {
         checkZk(conf)
         new OldConsumer(conf.filterSpec, getOldConsumerProps(conf))
@@ -69,6 +76,8 @@ object ConsoleConsumer extends Logging {
       // if we generated a random group id (as none specified explicitly) then avoid polluting zookeeper with persistent group data, this is a hack
       if (!conf.groupIdPassed)
         ZkUtils.maybeDeletePath(conf.options.valueOf(conf.zkConnectOpt), "/consumers/" + conf.consumerProps.get("group.id"))
+
+      shutdownLatch.countDown()
     }
   }
 
@@ -90,24 +99,33 @@ object ConsoleConsumer extends Logging {
     Runtime.getRuntime.addShutdownHook(new Thread() {
       override def run() {
         consumer.stop()
+
+        shutdownLatch.await()
       }
     })
   }
 
   def process(maxMessages: Integer, formatter: MessageFormatter, consumer: BaseConsumer, skipMessageOnError: Boolean) {
     while (messageCount < maxMessages || maxMessages == -1) {
-      messageCount += 1
       val msg: BaseConsumerRecord = try {
         consumer.receive()
       } catch {
-        case e: Throwable => {
+        case nse: StreamEndException =>
+          trace("Caught StreamEndException because consumer is shutdown, ignore and terminate.")
+          // Consumer is already closed
+          return
+        case nse: WakeupException =>
+          trace("Caught WakeupException because consumer is shutdown, ignore and terminate.")
+          // Consumer will be closed
+          return
+        case e: Throwable =>
           error("Error processing message, terminating consumer process: ", e)
           // Consumer will be closed
           return
-        }
       }
+      messageCount += 1
       try {
-        formatter.writeTo(msg.key, msg.value, System.out)
+        formatter.writeTo(msg.key, msg.value, msg.timestamp, msg.timestampType, System.out)
       } catch {
         case e: Throwable =>
           if (skipMessageOnError) {
@@ -162,7 +180,7 @@ object ConsoleConsumer extends Logging {
     props.putAll(config.consumerProps)
     props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, if (config.options.has(config.resetBeginningOpt)) "earliest" else "latest")
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServer)
-    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, if (config.keyDeserializer != null) config.keyDeserializer else "org.apache.kafka.common.serialization.StringDeserializer")
+    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, if (config.keyDeserializer != null) config.keyDeserializer else "org.apache.kafka.common.serialization.ByteArrayDeserializer")
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, if (config.valueDeserializer != null) config.valueDeserializer else "org.apache.kafka.common.serialization.ByteArrayDeserializer")
 
     props
@@ -239,10 +257,25 @@ object ConsoleConsumer extends Logging {
     var groupIdPassed = true
     val options: OptionSet = tryParse(parser, args)
     val useNewConsumer = options.has(useNewConsumerOpt)
-    val filterOpt = List(whitelistOpt, blacklistOpt).filter(options.has)
-    val topicOrFilterOpt = List(topicIdOpt, whitelistOpt, blacklistOpt).filter(options.has)
-    val topicArg = options.valueOf(topicOrFilterOpt.head)
-    val filterSpec = if (options.has(blacklistOpt)) new Blacklist(topicArg) else new Whitelist(topicArg)
+
+    // If using old consumer, exactly one of whitelist/blacklist/topic is required.
+    // If using new consumer, topic must be specified.
+    var topicArg: String = null
+    var whitelistArg: String = null
+    var filterSpec: TopicFilter = null
+    if (useNewConsumer) {
+      val topicOrFilterOpt = List(topicIdOpt, whitelistOpt).filter(options.has)
+      if (topicOrFilterOpt.size != 1)
+        CommandLineUtils.printUsageAndDie(parser, "Exactly one of whitelist/topic is required.")
+      topicArg = options.valueOf(topicIdOpt)
+      whitelistArg = options.valueOf(whitelistOpt)
+    } else {
+      val topicOrFilterOpt = List(topicIdOpt, whitelistOpt, blacklistOpt).filter(options.has)
+      if (topicOrFilterOpt.size != 1)
+        CommandLineUtils.printUsageAndDie(parser, "Exactly one of whitelist/blacklist/topic is required.")
+      topicArg = options.valueOf(topicOrFilterOpt.head)
+      filterSpec = if (options.has(blacklistOpt)) new Blacklist(topicArg) else new Whitelist(topicArg)
+    }
     val consumerProps = if (options.has(consumerConfigOpt))
       Utils.loadProps(options.valueOf(consumerConfigOpt))
     else
@@ -261,9 +294,6 @@ object ConsoleConsumer extends Logging {
     formatter.init(formatterArgs)
 
     CommandLineUtils.checkRequiredArgs(parser, options, if (useNewConsumer) bootstrapServerOpt else zkConnectOpt)
-
-    if (!useNewConsumer && topicOrFilterOpt.size != 1)
-      CommandLineUtils.printUsageAndDie(parser, "Exactly one of whitelist/blacklist/topic is required.")
 
     if (options.has(csvMetricsReporterEnabledOpt)) {
       val csvReporterProps = new Properties()
@@ -305,8 +335,8 @@ object ConsoleConsumer extends Logging {
   }
 }
 
-trait MessageFormatter {
-  def writeTo(key: Array[Byte], value: Array[Byte], output: PrintStream)
+trait MessageFormatter{
+  def writeTo(key: Array[Byte], value: Array[Byte], timestamp: Long, timestampType: TimestampType, output: PrintStream)
 
   def init(props: Properties) {}
 
@@ -327,20 +357,37 @@ class DefaultMessageFormatter extends MessageFormatter {
       lineSeparator = props.getProperty("line.separator").getBytes
   }
 
-  def writeTo(key: Array[Byte], value: Array[Byte], output: PrintStream) {
-    if (printKey) {
-      output.write(if (key == null) "null".getBytes() else key)
+  def writeTo(key: Array[Byte], value: Array[Byte], timestamp: Long, timestampType: TimestampType, output: PrintStream) {
+    if (timestampType != TimestampType.NO_TIMESTAMP_TYPE) {
+      output.write(s"$timestampType:$timestamp".getBytes)
       output.write(keySeparator)
     }
-    output.write(if (value == null) "null".getBytes() else value)
+    if (printKey) {
+      output.write(if (key == null) "null".getBytes else key)
+      output.write(keySeparator)
+    }
+    output.write(if (value == null) "null".getBytes else value)
     output.write(lineSeparator)
+  }
+}
+
+class LoggingMessageFormatter extends MessageFormatter   {
+  private val defaultWriter: DefaultMessageFormatter = new DefaultMessageFormatter
+  val logger = Logger.getLogger(getClass().getName)
+
+  def writeTo(key: Array[Byte], value: Array[Byte], timestamp: Long, timestampType: TimestampType, output: PrintStream): Unit = {
+    defaultWriter.writeTo(key, value, timestamp, timestampType, output)
+    if(logger.isInfoEnabled)
+      logger.info({if (timestampType != TimestampType.NO_TIMESTAMP_TYPE) s"$timestampType:$timestamp, " else ""} +
+                  s"key:${if (key == null) "null" else new String(key)}, " +
+                  s"value:${if (value == null) "null" else new String(value)}")
   }
 }
 
 class NoOpMessageFormatter extends MessageFormatter {
   override def init(props: Properties) {}
 
-  def writeTo(key: Array[Byte], value: Array[Byte], output: PrintStream) {}
+  def writeTo(key: Array[Byte], value: Array[Byte], timestamp: Long, timestampType: TimestampType, output: PrintStream){}
 }
 
 class ChecksumMessageFormatter extends MessageFormatter {
@@ -354,8 +401,12 @@ class ChecksumMessageFormatter extends MessageFormatter {
       topicStr = ""
   }
 
-  def writeTo(key: Array[Byte], value: Array[Byte], output: PrintStream) {
-    val chksum = new Message(value, key).checksum
+  def writeTo(key: Array[Byte], value: Array[Byte], timestamp: Long, timestampType: TimestampType, output: PrintStream) {
+    val chksum =
+      if (timestampType != TimestampType.NO_TIMESTAMP_TYPE)
+        new Message(value, key, timestamp, timestampType, NoCompressionCodec, 0, -1, Message.MagicValue_V1).checksum
+      else
+        new Message(value, key, Message.NoTimestamp, Message.MagicValue_V0).checksum
     output.println(topicStr + "checksum:" + chksum)
   }
 }

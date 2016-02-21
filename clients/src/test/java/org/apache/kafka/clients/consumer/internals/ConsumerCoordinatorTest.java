@@ -19,10 +19,13 @@ package org.apache.kafka.clients.consumer.internals;
 import org.apache.kafka.clients.ClientRequest;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.MockClient;
+import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.kafka.clients.consumer.RangeAssignor;
+import org.apache.kafka.clients.consumer.RoundRobinAssignor;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
@@ -37,6 +40,7 @@ import org.apache.kafka.common.protocol.types.Struct;
 import org.apache.kafka.common.requests.GroupCoordinatorResponse;
 import org.apache.kafka.common.requests.HeartbeatResponse;
 import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.requests.JoinGroupRequest.ProtocolMetadata;
 import org.apache.kafka.common.requests.JoinGroupResponse;
 import org.apache.kafka.common.requests.LeaveGroupRequest;
 import org.apache.kafka.common.requests.LeaveGroupResponse;
@@ -56,7 +60,6 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -74,7 +77,6 @@ public class ConsumerCoordinatorTest {
     private int sessionTimeoutMs = 10;
     private int heartbeatIntervalMs = 2;
     private long retryBackoffMs = 100;
-    private long requestTimeoutMs = 5000;
     private boolean autoCommitEnabled = false;
     private long autoCommitIntervalMs = 5000;
     private MockPartitionAssignor partitionAssignor = new MockPartitionAssignor();
@@ -86,7 +88,6 @@ public class ConsumerCoordinatorTest {
     private SubscriptionState subscriptions;
     private Metadata metadata;
     private Metrics metrics;
-    private Map<String, String> metricTags = new LinkedHashMap<>();
     private ConsumerNetworkClient consumerClient;
     private MockRebalanceListener rebalanceListener;
     private MockCommitCallback defaultOffsetCommitCallback;
@@ -106,23 +107,7 @@ public class ConsumerCoordinatorTest {
         this.partitionAssignor.clear();
 
         client.setNode(node);
-
-        this.coordinator = new ConsumerCoordinator(
-                consumerClient,
-                groupId,
-                sessionTimeoutMs,
-                heartbeatIntervalMs,
-                assignors,
-                metadata,
-                subscriptions,
-                metrics,
-                "consumer" + groupId,
-                metricTags,
-                time,
-                retryBackoffMs,
-                defaultOffsetCommitCallback,
-                autoCommitEnabled,
-                autoCommitIntervalMs);
+        this.coordinator = buildCoordinator(metrics, assignors);
     }
 
     @After
@@ -417,7 +402,7 @@ public class ConsumerCoordinatorTest {
                         leaveRequest.groupId().equals(groupId);
             }
         }, new LeaveGroupResponse(Errors.NONE.code()).toStruct());
-        coordinator.maybeLeaveGroup(false);
+        coordinator.maybeLeaveGroup();
         assertTrue(received.get());
         assertEquals(JoinGroupRequest.UNKNOWN_MEMBER_ID, coordinator.memberId);
         assertEquals(OffsetCommitRequest.DEFAULT_GENERATION_ID, coordinator.generation);
@@ -671,7 +656,7 @@ public class ConsumerCoordinatorTest {
         // now switch to manual assignment
         client.prepareResponse(new LeaveGroupResponse(Errors.NONE.code()).toStruct());
         subscriptions.unsubscribe();
-        coordinator.maybeLeaveGroup(false);
+        coordinator.maybeLeaveGroup();
         subscriptions.assignFromUser(Arrays.asList(tp));
 
         // the client should not reuse generation/memberId from auto-subscribed generation
@@ -796,7 +781,37 @@ public class ConsumerCoordinatorTest {
         coordinator.commitOffsetsSync(Collections.singletonMap(tp, new OffsetAndMetadata(100L, "metadata")));
     }
 
-    @Test(expected = ApiException.class)
+    @Test(expected = CommitFailedException.class)
+    public void testCommitOffsetIllegalGeneration() {
+        // we cannot retry if a rebalance occurs before the commit completed
+        client.prepareResponse(consumerMetadataResponse(node, Errors.NONE.code()));
+        coordinator.ensureCoordinatorKnown();
+
+        client.prepareResponse(offsetCommitResponse(Collections.singletonMap(tp, Errors.ILLEGAL_GENERATION.code())));
+        coordinator.commitOffsetsSync(Collections.singletonMap(tp, new OffsetAndMetadata(100L, "metadata")));
+    }
+
+    @Test(expected = CommitFailedException.class)
+    public void testCommitOffsetUnknownMemberId() {
+        // we cannot retry if a rebalance occurs before the commit completed
+        client.prepareResponse(consumerMetadataResponse(node, Errors.NONE.code()));
+        coordinator.ensureCoordinatorKnown();
+
+        client.prepareResponse(offsetCommitResponse(Collections.singletonMap(tp, Errors.UNKNOWN_MEMBER_ID.code())));
+        coordinator.commitOffsetsSync(Collections.singletonMap(tp, new OffsetAndMetadata(100L, "metadata")));
+    }
+
+    @Test(expected = CommitFailedException.class)
+    public void testCommitOffsetRebalanceInProgress() {
+        // we cannot retry if a rebalance occurs before the commit completed
+        client.prepareResponse(consumerMetadataResponse(node, Errors.NONE.code()));
+        coordinator.ensureCoordinatorKnown();
+
+        client.prepareResponse(offsetCommitResponse(Collections.singletonMap(tp, Errors.REBALANCE_IN_PROGRESS.code())));
+        coordinator.commitOffsetsSync(Collections.singletonMap(tp, new OffsetAndMetadata(100L, "metadata")));
+    }
+
+    @Test(expected = KafkaException.class)
     public void testCommitOffsetSyncCallbackWithNonRetriableException() {
         client.prepareResponse(consumerMetadataResponse(node, Errors.NONE.code()));
         coordinator.ensureCoordinatorKnown();
@@ -859,6 +874,47 @@ public class ConsumerCoordinatorTest {
         coordinator.refreshCommittedOffsetsIfNeeded();
         assertFalse(subscriptions.refreshCommitsNeeded());
         assertEquals(null, subscriptions.committed(tp));
+    }
+
+    @Test
+    public void testProtocolMetadataOrder() {
+        RoundRobinAssignor roundRobin = new RoundRobinAssignor();
+        RangeAssignor range = new RangeAssignor();
+
+        try (Metrics metrics = new Metrics(time)) {
+            ConsumerCoordinator coordinator = buildCoordinator(metrics, Arrays.<PartitionAssignor>asList(roundRobin, range));
+            List<ProtocolMetadata> metadata = coordinator.metadata();
+            assertEquals(2, metadata.size());
+            assertEquals(roundRobin.name(), metadata.get(0).name());
+            assertEquals(range.name(), metadata.get(1).name());
+        }
+
+        try (Metrics metrics = new Metrics(time)) {
+            ConsumerCoordinator coordinator = buildCoordinator(metrics, Arrays.<PartitionAssignor>asList(range, roundRobin));
+            List<ProtocolMetadata> metadata = coordinator.metadata();
+            assertEquals(2, metadata.size());
+            assertEquals(range.name(), metadata.get(0).name());
+            assertEquals(roundRobin.name(), metadata.get(1).name());
+        }
+    }
+
+    private ConsumerCoordinator buildCoordinator(Metrics metrics, List<PartitionAssignor> assignors) {
+        return new ConsumerCoordinator(
+                consumerClient,
+                groupId,
+                sessionTimeoutMs,
+                heartbeatIntervalMs,
+                assignors,
+                metadata,
+                subscriptions,
+                metrics,
+                "consumer" + groupId,
+                time,
+                retryBackoffMs,
+                defaultOffsetCommitCallback,
+                autoCommitEnabled,
+                autoCommitIntervalMs,
+                null);
     }
 
     private Struct consumerMetadataResponse(Node node, short error) {

@@ -33,7 +33,7 @@ import kafka.server.KafkaConfig
 import kafka.utils._
 import org.apache.kafka.common.MetricName
 import org.apache.kafka.common.metrics._
-import org.apache.kafka.common.network.{Selector => KSelector, LoginType, Mode, ChannelBuilders, InvalidReceiveException}
+import org.apache.kafka.common.network.{Selector => KSelector, LoginType, Mode, ChannelBuilders}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.protocol.SecurityProtocol
 import org.apache.kafka.common.protocol.types.SchemaException
@@ -70,7 +70,7 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
   private val allMetricNames = (0 until totalProcessorThreads).map { i =>
     val tags = new util.HashMap[String, String]()
     tags.put("networkProcessor", i.toString)
-    new MetricName("io-wait-ratio", "socket-server-metrics", tags)
+    metrics.metricName("io-wait-ratio", "socket-server-metrics", tags)
   }
 
   /**
@@ -384,7 +384,7 @@ private[kafka] class Processor(val id: Int,
   newGauge("IdlePercent",
     new Gauge[Double] {
       def value = {
-        metrics.metrics().get(new MetricName("io-wait-ratio", "socket-server-metrics", metricTags)).value()
+        metrics.metrics().get(metrics.metricName("io-wait-ratio", "socket-server-metrics", metricTags)).value()
       }
     },
     metricTags.asScala
@@ -417,14 +417,12 @@ private[kafka] class Processor(val id: Int,
             swallow(closeAll())
             shutdownComplete()
             throw e
-          case e: InvalidReceiveException =>
-            // Log warning and continue since Selector already closed the connection
-            warn("Connection was closed due to invalid receive. Processor will continue handling other connections")
         }
         selector.completedReceives.asScala.foreach { receive =>
           try {
             val channel = selector.channel(receive.source)
-            val session = RequestChannel.Session(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, channel.principal().getName), channel.socketDescription)
+            val session = RequestChannel.Session(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, channel.principal.getName),
+              channel.socketAddress)
             val req = RequestChannel.Request(processor = id, connectionId = receive.source, session = session, buffer = receive.payload, startTimeMs = time.milliseconds, securityProtocol = protocol)
             requestChannel.sendRequest(req)
           } catch {
@@ -437,11 +435,11 @@ private[kafka] class Processor(val id: Int,
         }
 
         selector.completedSends.asScala.foreach { send =>
-          val resp = inflightResponses.remove(send.destination()).getOrElse {
+          val resp = inflightResponses.remove(send.destination).getOrElse {
             throw new IllegalStateException(s"Send for ${send.destination} completed, but not in `inflightResponses`")
           }
           resp.request.updateRequestMetrics()
-          selector.unmute(send.destination())
+          selector.unmute(send.destination)
         }
 
         selector.disconnected.asScala.foreach { connectionId =>

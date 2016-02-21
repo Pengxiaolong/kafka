@@ -13,6 +13,7 @@
 
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.BrokerEndPoint;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
@@ -22,7 +23,13 @@ import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class UpdateMetadataRequest extends AbstractRequest {
 
@@ -60,19 +67,6 @@ public class UpdateMetadataRequest extends AbstractRequest {
         public final int port;
 
         public EndPoint(String host, int port) {
-            this.host = host;
-            this.port = port;
-        }
-    }
-
-    @Deprecated
-    public static final class BrokerEndPoint {
-        public final int id;
-        public final String host;
-        public final int port;
-
-        public BrokerEndPoint(int id, String host, int port) {
-            this.id = id;
             this.host = host;
             this.port = port;
         }
@@ -122,8 +116,8 @@ public class UpdateMetadataRequest extends AbstractRequest {
         Set<Broker> brokers = new HashSet<>(brokerEndPoints.size());
         for (BrokerEndPoint brokerEndPoint : brokerEndPoints) {
             Map<SecurityProtocol, EndPoint> endPoints = Collections.singletonMap(SecurityProtocol.PLAINTEXT,
-                    new EndPoint(brokerEndPoint.host, brokerEndPoint.port));
-            brokers.add(new Broker(brokerEndPoint.id, endPoints));
+                    new EndPoint(brokerEndPoint.host(), brokerEndPoint.port()));
+            brokers.add(new Broker(brokerEndPoint.id(), endPoints));
         }
         return brokers;
     }
@@ -286,6 +280,6 @@ public class UpdateMetadataRequest extends AbstractRequest {
     }
 
     public static UpdateMetadataRequest parse(ByteBuffer buffer) {
-        return new UpdateMetadataRequest((Struct) CURRENT_SCHEMA.read(buffer));
+        return new UpdateMetadataRequest(CURRENT_SCHEMA.read(buffer));
     }
 }

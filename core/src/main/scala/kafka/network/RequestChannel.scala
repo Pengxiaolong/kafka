@@ -17,36 +17,33 @@
 
 package kafka.network
 
+import java.net.InetAddress
 import java.nio.ByteBuffer
-import java.security.Principal
+import java.util.HashMap
 import java.util.concurrent._
 
 import com.yammer.metrics.core.Gauge
 import kafka.api._
-import kafka.common.TopicAndPartition
-import kafka.message.ByteBufferMessageSet
 import kafka.metrics.KafkaMetricsGroup
 import kafka.utils.{Logging, SystemTime}
+import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.network.Send
 import org.apache.kafka.common.protocol.{ApiKeys, SecurityProtocol}
-import org.apache.kafka.common.requests.{AbstractRequest, RequestHeader}
+import org.apache.kafka.common.requests.{RequestSend, ProduceRequest, AbstractRequest, RequestHeader}
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.log4j.Logger
 
 
 object RequestChannel extends Logging {
-  val AllDone = new Request(processor = 1, connectionId = "2", new Session(KafkaPrincipal.ANONYMOUS, ""), buffer = getShutdownReceive(), startTimeMs = 0, securityProtocol = SecurityProtocol.PLAINTEXT)
+  val AllDone = new Request(processor = 1, connectionId = "2", new Session(KafkaPrincipal.ANONYMOUS, InetAddress.getLocalHost()), buffer = getShutdownReceive(), startTimeMs = 0, securityProtocol = SecurityProtocol.PLAINTEXT)
 
   def getShutdownReceive() = {
-    val emptyProducerRequest = new ProducerRequest(0, 0, "", 0, 0, collection.mutable.Map[TopicAndPartition, ByteBufferMessageSet]())
-    val byteBuffer = ByteBuffer.allocate(emptyProducerRequest.sizeInBytes + 2)
-    byteBuffer.putShort(RequestKeys.ProduceKey)
-    emptyProducerRequest.writeTo(byteBuffer)
-    byteBuffer.rewind()
-    byteBuffer
+    val emptyRequestHeader = new RequestHeader(ApiKeys.PRODUCE.id, "", 0)
+    val emptyProduceRequest = new ProduceRequest(0, 0, new HashMap[TopicPartition, ByteBuffer]())
+    RequestSend.serialize(emptyRequestHeader, emptyProduceRequest.toStruct)
   }
 
-  case class Session(principal: KafkaPrincipal, host: String)
+  case class Session(principal: KafkaPrincipal, clientAddress: InetAddress)
 
   case class Request(processor: Int, connectionId: String, session: Session, private var buffer: ByteBuffer, startTimeMs: Long, securityProtocol: SecurityProtocol) {
     // These need to be volatile because the readers are in the network thread and the writers are in the request
@@ -58,13 +55,24 @@ object RequestChannel extends Logging {
     @volatile var apiRemoteCompleteTimeMs = -1L
 
     val requestId = buffer.getShort()
+
+    // TODO: this will be removed once we migrated to client-side format
     // for server-side request / response format
+    // NOTE: this map only includes the server-side request/response handlers. Newer
+    // request types should only use the client-side versions which are parsed with
+    // o.a.k.common.requests.AbstractRequest.getRequest()
+    private val keyToNameAndDeserializerMap: Map[Short, (ByteBuffer) => RequestOrResponse]=
+      Map(ApiKeys.FETCH.id -> FetchRequest.readFrom,
+        ApiKeys.METADATA.id -> TopicMetadataRequest.readFrom,
+        ApiKeys.CONTROLLED_SHUTDOWN_KEY.id -> ControlledShutdownRequest.readFrom,
+        ApiKeys.OFFSET_COMMIT.id -> OffsetCommitRequest.readFrom,
+        ApiKeys.OFFSET_FETCH.id -> OffsetFetchRequest.readFrom
+      )
+
     // TODO: this will be removed once we migrated to client-side format
     val requestObj =
-      if ( RequestKeys.keyToNameAndDeserializerMap.contains(requestId))
-        RequestKeys.deserializerForKey(requestId)(buffer)
-      else
-        null
+      keyToNameAndDeserializerMap.get(requestId).map(readFrom => readFrom(buffer)).orNull
+
     // if we failed to find a server-side mapping, then try using the
     // client-side request / response format
     val header: RequestHeader =
@@ -75,7 +83,12 @@ object RequestChannel extends Logging {
         null
     val body: AbstractRequest =
       if (requestObj == null)
-        AbstractRequest.getRequest(header.apiKey, header.apiVersion, buffer)
+        try {
+          AbstractRequest.getRequest(header.apiKey, header.apiVersion, buffer)
+        } catch {
+          case ex: Throwable =>
+            throw new InvalidRequestException(s"Error getting request for apiKey: ${header.apiKey} and apiVersion: ${header.apiVersion}", ex)
+        }
       else
         null
 
@@ -112,7 +125,7 @@ object RequestChannel extends Logging {
       val responseSendTime = (endTimeMs - responseDequeueTimeMs).max(0L)
       val totalTime = endTimeMs - startTimeMs
       var metricsList = List(RequestMetrics.metricsMap(ApiKeys.forId(requestId).name))
-      if (requestId == RequestKeys.FetchKey) {
+      if (requestId == ApiKeys.FETCH.id) {
         val isFromFollower = requestObj.asInstanceOf[FetchRequest].isFromFollower
         metricsList ::= ( if (isFromFollower)
                             RequestMetrics.metricsMap(RequestMetrics.followFetchMetricName)
@@ -138,7 +151,7 @@ object RequestChannel extends Logging {
           .format(requestDesc(false), connectionId, totalTime, requestQueueTime, apiLocalTime, apiRemoteTime, responseQueueTime, responseSendTime, securityProtocol, session.principal))
     }
   }
-  
+
   case class Response(processor: Int, request: Request, responseSend: Send, responseAction: ResponseAction) {
     request.responseCompleteTimeMs = SystemTime.milliseconds
 
@@ -186,8 +199,8 @@ class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMe
   def sendRequest(request: RequestChannel.Request) {
     requestQueue.put(request)
   }
-  
-  /** Send a response back to the socket server to be sent over the network */ 
+
+  /** Send a response back to the socket server to be sent over the network */
   def sendResponse(response: RequestChannel.Response) {
     responseQueues(response.processor).put(response)
     for(onResponse <- responseListeners)
@@ -224,7 +237,7 @@ class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMe
     response
   }
 
-  def addResponseListener(onResponse: Int => Unit) { 
+  def addResponseListener(onResponse: Int => Unit) {
     responseListeners ::= onResponse
   }
 
@@ -235,8 +248,8 @@ class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMe
 
 object RequestMetrics {
   val metricsMap = new scala.collection.mutable.HashMap[String, RequestMetrics]
-  val consumerFetchMetricName = RequestKeys.nameForKey(RequestKeys.FetchKey) + "Consumer"
-  val followFetchMetricName = RequestKeys.nameForKey(RequestKeys.FetchKey) + "Follower"
+  val consumerFetchMetricName = ApiKeys.FETCH.name + "Consumer"
+  val followFetchMetricName = ApiKeys.FETCH.name + "Follower"
   (ApiKeys.values().toList.map(e => e.name)
     ++ List(consumerFetchMetricName, followFetchMetricName)).foreach(name => metricsMap.put(name, new RequestMetrics(name)))
 }

@@ -14,10 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package integration.kafka.api
+package kafka.api
 
 import kafka.admin.AdminClient
-import kafka.api.IntegrationTestHarness
 import kafka.server.KafkaConfig
 import kafka.utils.{TestUtils, Logging}
 import org.apache.kafka.clients.consumer.ConsumerConfig
@@ -105,21 +104,14 @@ class AdminClientTest extends IntegrationTestHarness with Logging {
       !consumers(0).assignment().isEmpty
     }, "Expected non-empty assignment")
 
-    val (_, assignment) = client.describeConsumerGroup(groupId)
-    assertEquals(1, assignment.size)
-    for (partitions <- assignment.values)
-      assertEquals(Set(tp, tp2), partitions.toSet)
+    val consumerSummaries = client.describeConsumerGroup(groupId)
+    assertEquals(1, consumerSummaries.size)
+    assertEquals(Set(tp, tp2), consumerSummaries.head.assignment.toSet)
   }
 
   @Test
   def testDescribeConsumerGroupForNonExistentGroup() {
     val nonExistentGroup = "non" + groupId
-    try {
-      client.describeConsumerGroup(nonExistentGroup)
-      fail("Should have failed for non existent group.")
-    } catch {
-      case ex: IllegalArgumentException => // Pass
-      case _: Throwable => fail("Should have failed for non existent group with IllegalArgumentException.")
-    }
+    assertTrue("Expected empty ConsumerSummary list", client.describeConsumerGroup(nonExistentGroup).isEmpty)
   }
 }

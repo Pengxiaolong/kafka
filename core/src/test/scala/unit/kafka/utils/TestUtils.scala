@@ -19,6 +19,7 @@ package kafka.utils
 
 import java.io._
 import java.nio._
+import java.nio.file.Files
 import java.nio.channels._
 import java.util.Random
 import java.util.Properties
@@ -28,13 +29,10 @@ import charset.Charset
 
 import kafka.security.auth.{Resource, Authorizer, Acl}
 import org.apache.kafka.common.protocol.SecurityProtocol
-import org.apache.kafka.common.security.ssl.SslFactory
 import org.apache.kafka.common.utils.Utils._
 import org.apache.kafka.test.TestSslUtils
 
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
-
-import org.I0Itec.zkclient.{ZkClient, ZkConnection}
 
 import kafka.server._
 import kafka.producer._
@@ -85,17 +83,7 @@ object TestUtils extends Logging {
    * Create a temporary directory
    */
   def tempDir(): File = {
-    val f = new File(IoTmpDir, "kafka-" + random.nextInt(1000000))
-    f.mkdirs()
-    f.deleteOnExit()
-
-    Runtime.getRuntime().addShutdownHook(new Thread() {
-      override def run() = {
-        CoreUtils.rm(f)
-      }
-    })
-
-    f
+    tempRelativeDir(IoTmpDir)
   }
 
   def tempTopic(): String = "testTopic" + random.nextInt(1000000)
@@ -104,20 +92,37 @@ object TestUtils extends Logging {
    * Create a temporary relative directory
    */
   def tempRelativeDir(parent: String): File = {
-    val f = new File(parent, "kafka-" + random.nextInt(1000000))
-    f.mkdirs()
+    val parentFile = new File(parent)
+    parentFile.mkdirs()
+    val f = Files.createTempDirectory(parentFile.toPath, "kafka-").toFile
     f.deleteOnExit()
+
+    Runtime.getRuntime().addShutdownHook(new Thread() {
+      override def run() = {
+        CoreUtils.rm(f)
+      }
+    })
     f
   }
 
   /**
-   * Create a temporary file
+   * Create a random log directory in the format <string>-<int> used for Kafka partition logs.
+   * It is the responsibility of the caller to set up a shutdown hook for deletion of the directory.
    */
-  def tempFile(): File = {
-    val f = File.createTempFile("kafka", ".tmp")
+  def randomPartitionLogDir(parentDir: File): File = {
+    val attempts = 1000
+    val f = Iterator.continually(new File(parentDir, "kafka-" + random.nextInt(1000000)))
+                                  .take(attempts).find(_.mkdir())
+                                  .getOrElse(sys.error(s"Failed to create directory after $attempts attempts"))
     f.deleteOnExit()
     f
   }
+
+
+  /**
+   * Create a temporary file
+   */
+  def tempFile(): File = org.apache.kafka.test.TestUtils.tempFile()
 
   /**
    * Create a temporary file and return an open file channel for this file
@@ -204,9 +209,10 @@ object TestUtils extends Logging {
     props.put("controlled.shutdown.enable", enableControlledShutdown.toString)
     props.put("delete.topic.enable", enableDeleteTopic.toString)
     props.put("controlled.shutdown.retry.backoff.ms", "100")
+    props.put("log.cleaner.dedupe.buffer.size", "2097152")
 
     if (protocolAndPorts.exists { case (protocol, _) => usesSslTransportLayer(protocol) })
-      props.putAll(sslConfigs(Mode.SERVER, true, trustStoreFile, s"server$nodeId"))
+      props.putAll(sslConfigs(Mode.SERVER, false, trustStoreFile, s"server$nodeId"))
 
     interBrokerSecurityProtocol.foreach { protocol =>
       props.put(KafkaConfig.InterBrokerSecurityProtocolProp, protocol.name)
@@ -276,8 +282,11 @@ object TestUtils extends Logging {
    * Wrap the message in a message set
    * @param payload The bytes of the message
    */
-  def singleMessageSet(payload: Array[Byte], codec: CompressionCodec = NoCompressionCodec, key: Array[Byte] = null) =
-    new ByteBufferMessageSet(compressionCodec = codec, messages = new Message(payload, key))
+  def singleMessageSet(payload: Array[Byte],
+                       codec: CompressionCodec = NoCompressionCodec,
+                       key: Array[Byte] = null,
+                       magicValue: Byte = Message.CurrentMagicValue) =
+    new ByteBufferMessageSet(compressionCodec = codec, messages = new Message(payload, key, Message.NoTimestamp, magicValue))
 
   /**
    * Generate an array of random bytes
@@ -392,12 +401,12 @@ object TestUtils extends Logging {
   }
 
   /**
-   * Create a hexidecimal string for the given bytes
+   * Create a hexadecimal string for the given bytes
    */
   def hexString(bytes: Array[Byte]): String = hexString(ByteBuffer.wrap(bytes))
 
   /**
-   * Create a hexidecimal string for the given bytes
+   * Create a hexadecimal string for the given bytes
    */
   def hexString(buffer: ByteBuffer): String = {
     val builder = new StringBuilder("0x")
@@ -433,7 +442,7 @@ object TestUtils extends Logging {
                               certAlias: String): Properties = {
     val props = new Properties
     if (usesSslTransportLayer(securityProtocol))
-      props.putAll(sslConfigs(mode, false, trustStoreFile, certAlias))
+      props.putAll(sslConfigs(mode, securityProtocol == SecurityProtocol.SSL, trustStoreFile, certAlias))
     props.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, securityProtocol.name)
     props
   }
@@ -446,8 +455,7 @@ object TestUtils extends Logging {
    */
   def createNewProducer(brokerList: String,
                         acks: Int = -1,
-                        metadataFetchTimeout: Long = 3000L,
-                        blockOnBufferFull: Boolean = true,
+                        maxBlockMs: Long = 60 * 1000L,
                         bufferSize: Long = 1024L * 1024L,
                         retries: Int = 0,
                         lingerMs: Long = 0,
@@ -459,7 +467,7 @@ object TestUtils extends Logging {
     val producerProps = props.getOrElse(new Properties)
     producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerList)
     producerProps.put(ProducerConfig.ACKS_CONFIG, acks.toString)
-    producerProps.put(ProducerConfig.METADATA_FETCH_TIMEOUT_CONFIG, metadataFetchTimeout.toString)
+    producerProps.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, maxBlockMs.toString)
     producerProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, bufferSize.toString)
     producerProps.put(ProducerConfig.RETRIES_CONFIG, retries.toString)
 
@@ -475,7 +483,14 @@ object TestUtils extends Logging {
       if (!producerProps.containsKey(key)) producerProps.put(key, value)
     }
 
-    producerProps.putAll(producerSecurityConfigs(securityProtocol, trustStoreFile))
+    /*
+     * It uses CommonClientConfigs.SECURITY_PROTOCOL_CONFIG to determine whether
+     * securityConfigs has been invoked already. For example, we need to
+     * invoke it before this call in IntegrationTestHarness, otherwise the
+     * SSL client auth fails.
+     */
+    if(!producerProps.containsKey(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG))
+      producerProps.putAll(producerSecurityConfigs(securityProtocol, trustStoreFile))
 
     new KafkaProducer[Array[Byte],Array[Byte]](producerProps)
   }
@@ -492,29 +507,42 @@ object TestUtils extends Logging {
    * Create a new consumer with a few pre-configured properties.
    */
   def createNewConsumer(brokerList: String,
-                        groupId: String,
+                        groupId: String = "group",
                         autoOffsetReset: String = "earliest",
                         partitionFetchSize: Long = 4096L,
                         partitionAssignmentStrategy: String = classOf[RangeAssignor].getName,
                         sessionTimeout: Int = 30000,
                         securityProtocol: SecurityProtocol,
-                        trustStoreFile: Option[File] = None) : KafkaConsumer[Array[Byte],Array[Byte]] = {
+                        trustStoreFile: Option[File] = None,
+                        props: Option[Properties] = None) : KafkaConsumer[Array[Byte],Array[Byte]] = {
     import org.apache.kafka.clients.consumer.ConsumerConfig
 
-    val consumerProps= new Properties()
+    val consumerProps = props.getOrElse(new Properties())
     consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerList)
-    consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, groupId)
     consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, autoOffsetReset)
     consumerProps.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, partitionFetchSize.toString)
 
-    consumerProps.put(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG, "100")
-    consumerProps.put(ConsumerConfig.RECONNECT_BACKOFF_MS_CONFIG, "200")
-    consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArrayDeserializer")
-    consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArrayDeserializer")
-    consumerProps.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, partitionAssignmentStrategy)
-    consumerProps.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, sessionTimeout.toString)
+    val defaultProps = Map(
+      ConsumerConfig.RETRY_BACKOFF_MS_CONFIG -> "100",
+      ConsumerConfig.RECONNECT_BACKOFF_MS_CONFIG -> "200",
+      ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG -> "org.apache.kafka.common.serialization.ByteArrayDeserializer",
+      ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG -> "org.apache.kafka.common.serialization.ByteArrayDeserializer",
+      ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG -> partitionAssignmentStrategy,
+      ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG -> sessionTimeout.toString,
+      ConsumerConfig.GROUP_ID_CONFIG -> groupId)
 
-    consumerProps.putAll(consumerSecurityConfigs(securityProtocol, trustStoreFile))
+    defaultProps.foreach { case (key, value) =>
+      if (!consumerProps.containsKey(key)) consumerProps.put(key, value)
+    }
+
+    /*
+     * It uses CommonClientConfigs.SECURITY_PROTOCOL_CONFIG to determine whether
+     * securityConfigs has been invoked already. For example, we need to
+     * invoke it before this call in IntegrationTestHarness, otherwise the
+     * SSL client auth fails.
+     */
+    if(!consumerProps.containsKey(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG))
+      consumerProps.putAll(consumerSecurityConfigs(securityProtocol, trustStoreFile))
 
     new KafkaConsumer[Array[Byte],Array[Byte]](consumerProps)
   }
@@ -683,7 +711,7 @@ object TestUtils extends Logging {
 
   /**
    * Execute the given block. If it throws an assert error, retry. Repeat
-   * until no error is thrown or the time limit ellapses
+   * until no error is thrown or the time limit elapses
    */
   def retry(maxWaitMs: Long)(block: => Unit) {
     var wait = 1L
@@ -770,6 +798,16 @@ object TestUtils extends Logging {
       waitTime = timeout)
 
     leader
+  }
+
+  def waitUntilLeaderIsKnown(servers: Seq[KafkaServer], topic: String, partition: Int, timeout: Long = 5000L): Unit = {
+    TestUtils.waitUntilTrue(() => 
+      servers.exists { server =>
+        server.replicaManager.getPartition(topic, partition).exists(_.leaderReplicaIfLocal().isDefined)
+      },
+      "Partition [%s,%d] leaders not made yet after %d ms".format(topic, partition, timeout),
+      waitTime = timeout
+    )
   }
 
   def writeNonsenseToFile(fileName: File, position: Long, size: Int) {
@@ -979,12 +1017,7 @@ object TestUtils extends Logging {
     }
 
 
-    val sslConfigs = {
-      if (mode == Mode.SERVER)
-        TestSslUtils.createSslConfig(true, true, mode, trustStore, certAlias)
-      else
-        TestSslUtils.createSslConfig(clientCert, false, mode, trustStore, certAlias)
-    }
+    val sslConfigs = TestSslUtils.createSslConfig(clientCert, true, mode, trustStore, certAlias)
 
     val sslProps = new Properties()
     sslConfigs.foreach { case (k, v) => sslProps.put(k, v) }

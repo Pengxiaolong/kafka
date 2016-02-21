@@ -20,24 +20,33 @@ import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.network.Mode;
+import org.apache.kafka.common.config.types.Password;
 
-import javax.net.ssl.*;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
-
 import java.util.List;
 import java.util.Map;
 
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.TrustManagerFactory;
+
 public class SslFactory implements Configurable {
+
+    private final Mode mode;
+    private final String clientAuthConfigOverride;
 
     private String protocol;
     private String provider;
     private String kmfAlgorithm;
     private String tmfAlgorithm;
     private SecurityStore keystore = null;
-    private String keyPassword;
+    private Password keyPassword;
     private SecurityStore truststore;
     private String[] cipherSuites;
     private String[] enabledProtocols;
@@ -45,10 +54,14 @@ public class SslFactory implements Configurable {
     private SSLContext sslContext;
     private boolean needClientAuth;
     private boolean wantClientAuth;
-    private final Mode mode;
 
     public SslFactory(Mode mode) {
+        this(mode, null);
+    }
+
+    public SslFactory(Mode mode, String clientAuthConfigOverride) {
         this.mode = mode;
+        this.clientAuthConfigOverride = clientAuthConfigOverride;
     }
 
     @Override
@@ -69,7 +82,9 @@ public class SslFactory implements Configurable {
         if (endpointIdentification != null)
             this.endpointIdentification = endpointIdentification;
 
-        String clientAuthConfig = (String) configs.get(SslConfigs.SSL_CLIENT_AUTH_CONFIG);
+        String clientAuthConfig = clientAuthConfigOverride;
+        if (clientAuthConfig == null)
+            clientAuthConfig = (String) configs.get(SslConfigs.SSL_CLIENT_AUTH_CONFIG);
         if (clientAuthConfig != null) {
             if (clientAuthConfig.equals("required"))
                 this.needClientAuth = true;
@@ -82,12 +97,12 @@ public class SslFactory implements Configurable {
 
         createKeystore((String) configs.get(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG),
                        (String) configs.get(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG),
-                       (String) configs.get(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG),
-                       (String) configs.get(SslConfigs.SSL_KEY_PASSWORD_CONFIG));
+                       (Password) configs.get(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG),
+                       (Password) configs.get(SslConfigs.SSL_KEY_PASSWORD_CONFIG));
 
         createTruststore((String) configs.get(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG),
                          (String) configs.get(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG),
-                         (String) configs.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG));
+                         (Password) configs.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG));
         try {
             this.sslContext = createSSLContext();
         } catch (Exception e) {
@@ -108,8 +123,8 @@ public class SslFactory implements Configurable {
             String kmfAlgorithm = this.kmfAlgorithm != null ? this.kmfAlgorithm : KeyManagerFactory.getDefaultAlgorithm();
             KeyManagerFactory kmf = KeyManagerFactory.getInstance(kmfAlgorithm);
             KeyStore ks = keystore.load();
-            String keyPassword = this.keyPassword != null ? this.keyPassword : keystore.password;
-            kmf.init(ks, keyPassword.toCharArray());
+            Password keyPassword = this.keyPassword != null ? this.keyPassword : keystore.password;
+            kmf.init(ks, keyPassword.value().toCharArray());
             keyManagers = kmf.getKeyManagers();
         }
 
@@ -150,7 +165,7 @@ public class SslFactory implements Configurable {
         return sslContext;
     }
 
-    private void createKeystore(String type, String path, String password, String keyPassword) {
+    private void createKeystore(String type, String path, Password password, Password keyPassword) {
         if (path == null && password != null) {
             throw new KafkaException("SSL key store is not specified, but key store password is specified.");
         } else if (path != null && password == null) {
@@ -161,7 +176,7 @@ public class SslFactory implements Configurable {
         }
     }
 
-    private void createTruststore(String type, String path, String password) {
+    private void createTruststore(String type, String path, Password password) {
         if (path == null && password != null) {
             throw new KafkaException("SSL trust store is not specified, but trust store password is specified.");
         } else if (path != null && password == null) {
@@ -174,9 +189,9 @@ public class SslFactory implements Configurable {
     private class SecurityStore {
         private final String type;
         private final String path;
-        private final String password;
+        private final Password password;
 
-        private SecurityStore(String type, String path, String password) {
+        private SecurityStore(String type, String path, Password password) {
             this.type = type == null ? KeyStore.getDefaultType() : type;
             this.path = path;
             this.password = password;
@@ -187,7 +202,7 @@ public class SslFactory implements Configurable {
             try {
                 KeyStore ks = KeyStore.getInstance(type);
                 in = new FileInputStream(path);
-                ks.load(in, password.toCharArray());
+                ks.load(in, password.value().toCharArray());
                 return ks;
             } finally {
                 if (in != null) in.close();

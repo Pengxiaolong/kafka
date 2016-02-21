@@ -17,10 +17,10 @@ from ducktape.services.background_thread import BackgroundThreadService
 
 from kafkatest.services.kafka.directory import kafka_dir, KAFKA_TRUNK
 from kafkatest.services.kafka.version import TRUNK, LATEST_0_8_2
-from kafkatest.services.security.security_config import SecurityConfig
 
 import json
 import os
+import signal
 import subprocess
 import time
 
@@ -28,7 +28,6 @@ import time
 class VerifiableProducer(BackgroundThreadService):
     PERSISTENT_ROOT = "/mnt/verifiable_producer"
     STDOUT_CAPTURE = os.path.join(PERSISTENT_ROOT, "verifiable_producer.stdout")
-    STDERR_CAPTURE = os.path.join(PERSISTENT_ROOT, "verifiable_producer.stderr")
     LOG_DIR = os.path.join(PERSISTENT_ROOT, "logs")
     LOG_FILE = os.path.join(LOG_DIR, "verifiable_producer.log")
     LOG4J_CONFIG = os.path.join(PERSISTENT_ROOT, "tools-log4j.properties")
@@ -38,9 +37,6 @@ class VerifiableProducer(BackgroundThreadService):
         "verifiable_producer_stdout": {
             "path": STDOUT_CAPTURE,
             "collect_default": False},
-        "verifiable_producer_stderr": {
-            "path": STDERR_CAPTURE,
-            "collect_default": False},
         "verifiable_producer_log": {
             "path": LOG_FILE,
             "collect_default": True}
@@ -48,7 +44,6 @@ class VerifiableProducer(BackgroundThreadService):
 
     def __init__(self, context, num_nodes, kafka, topic, max_messages=-1, throughput=100000, version=TRUNK):
         super(VerifiableProducer, self).__init__(context, num_nodes)
-        self.log_level = "TRACE"
 
         self.kafka = kafka
         self.topic = topic
@@ -59,15 +54,15 @@ class VerifiableProducer(BackgroundThreadService):
             node.version = version
         self.acked_values = []
         self.not_acked_values = []
-
         self.prop_file = ""
-        self.security_config = kafka.security_config.client_config(self.prop_file)
-        self.prop_file += str(self.security_config)
+
 
     def _worker(self, idx, node):
         node.account.ssh("mkdir -p %s" % VerifiableProducer.PERSISTENT_ROOT, allow_fail=False)
 
         # Create and upload log properties
+        self.security_config = self.kafka.security_config.client_config(self.prop_file)
+        self.prop_file += str(self.security_config)
         log_config = self.render('tools_log4j.properties', log_file=VerifiableProducer.LOG_FILE)
         node.account.create_file(VerifiableProducer.LOG4J_CONFIG, log_config)
 
@@ -122,7 +117,7 @@ class VerifiableProducer(BackgroundThreadService):
         cmd += " export KAFKA_OPTS=%s;" % self.security_config.kafka_opts
         cmd += " export KAFKA_LOG4J_OPTS=\"-Dlog4j.configuration=file:%s\"; " % VerifiableProducer.LOG4J_CONFIG
         cmd += "/opt/" + kafka_dir(node) + "/bin/kafka-run-class.sh org.apache.kafka.tools.VerifiableProducer" \
-              " --topic %s --broker-list %s" % (self.topic, self.kafka.bootstrap_servers())
+              " --topic %s --broker-list %s" % (self.topic, self.kafka.bootstrap_servers(self.security_config.security_protocol))
         if self.max_messages > 0:
             cmd += " --max-messages %s" % str(self.max_messages)
         if self.throughput > 0:
@@ -132,9 +127,17 @@ class VerifiableProducer(BackgroundThreadService):
         cmd += " 2>> %s | tee -a %s &" % (VerifiableProducer.STDOUT_CAPTURE, VerifiableProducer.STDOUT_CAPTURE)
         return cmd
 
+    def kill_node(self, node, clean_shutdown=True, allow_fail=False):
+        if clean_shutdown:
+            sig = signal.SIGTERM
+        else:
+            sig = signal.SIGKILL
+        for pid in self.pids(node):
+            node.account.signal(pid, sig, allow_fail)
+
     def pids(self, node):
         try:
-            cmd = "ps ax | grep -i VerifiableProducer | grep java | grep -v grep | awk '{print $1}'"
+            cmd = "jps | grep -i VerifiableProducer | awk '{print $1}'"
             pid_arr = [pid for pid in node.account.ssh_capture(cmd, allow_fail=True, callback=int)]
             return pid_arr
         except (subprocess.CalledProcessError, ValueError) as e:
@@ -164,7 +167,7 @@ class VerifiableProducer(BackgroundThreadService):
             return len(self.not_acked_values)
 
     def stop_node(self, node):
-        node.account.kill_process("VerifiableProducer", allow_fail=False)
+        self.kill_node(node, clean_shutdown=False, allow_fail=False)
         if self.worker_threads is None:
             return
 
@@ -174,7 +177,7 @@ class VerifiableProducer(BackgroundThreadService):
             self.worker_threads[self.idx(node) - 1].join()
 
     def clean_node(self, node):
-        node.account.kill_process("VerifiableProducer", clean_shutdown=False, allow_fail=False)
+        self.kill_node(node, clean_shutdown=False, allow_fail=False)
         node.account.ssh("rm -rf " + self.PERSISTENT_ROOT, allow_fail=False)
         self.security_config.clean_node(node)
 

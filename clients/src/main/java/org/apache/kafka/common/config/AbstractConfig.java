@@ -12,10 +12,17 @@
  */
 package org.apache.kafka.common.config;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,6 +102,10 @@ public class AbstractConfig {
         return (String) get(key);
     }
 
+    public Password getPassword(String key) {
+        return (Password) get(key);
+    }
+
     public Class<?> getClass(String key) {
         return (Class<?>) get(key);
     }
@@ -105,17 +116,24 @@ public class AbstractConfig {
         return keys;
     }
 
-    public Properties unusedProperties() {
-        Set<String> unusedKeys = this.unused();
-        Properties unusedProps = new Properties();
-        for (String key : unusedKeys)
-            unusedProps.put(key, this.originals.get(key));
-        return unusedProps;
-    }
-
     public Map<String, Object> originals() {
         Map<String, Object> copy = new RecordingMap<>();
         copy.putAll(originals);
+        return copy;
+    }
+
+    /**
+     * Get all the original settings, ensuring that all values are of type String.
+     * @return the original settings
+     * @throw ClassCastException if any of the values are not strings
+     */
+    public Map<String, String> originalsStrings() {
+        Map<String, String> copy = new RecordingMap<>();
+        for (Map.Entry<String, ?> entry : originals.entrySet()) {
+            if (!(entry.getValue() instanceof String))
+                throw new ClassCastException("Non-string value found in original settings");
+            copy.put(entry.getKey(), (String) entry.getValue());
+        }
         return copy;
     }
 
@@ -181,9 +199,19 @@ public class AbstractConfig {
         return t.cast(o);
     }
 
+    /**
+     * Get a list of configured instances of the given class specified by the given configuration key. The configuration
+     * may specify either null or an empty string to indicate no configured instances. In both cases, this method
+     * returns an empty list to indicate no configured instances.
+     * @param key The configuration key for the class
+     * @param t The interface the class should implement
+     * @return The list of configured instances
+     */
     public <T> List<T> getConfiguredInstances(String key, Class<T> t) {
         List<String> klasses = getList(key);
         List<T> objects = new ArrayList<T>();
+        if (klasses == null)
+            return objects;
         for (String klass : klasses) {
             Object o;
             try {

@@ -13,6 +13,7 @@
 package kafka.admin
 
 import java.nio.ByteBuffer
+import java.util.Properties
 import java.util.concurrent.atomic.AtomicInteger
 
 import kafka.common.KafkaException
@@ -51,11 +52,7 @@ class AdminClient(val time: Time,
       client.poll(future)
 
       if (future.succeeded())
-        return if (future.value().wasDisconnected()) {
-          throw new DisconnectException()
-        } else {
-          future.value().responseBody()
-        }
+        return future.value().responseBody()
 
       now = time.milliseconds()
     } while (now < deadline && future.exception().isInstanceOf[SendFailedException])
@@ -138,52 +135,41 @@ class AdminClient(val time: Time,
       throw new KafkaException(s"Response from broker contained no metadata for group ${groupId}")
 
     Errors.forCode(metadata.errorCode()).maybeThrow()
-    val members = metadata.members().map {
-      case member =>
-        val metadata = Utils.readBytes(member.memberMetadata())
-        val assignment = Utils.readBytes(member.memberAssignment())
-        MemberSummary(member.memberId(), member.clientId(), member.clientHost(), metadata, assignment)
+    val members = metadata.members().map { member =>
+      val metadata = Utils.readBytes(member.memberMetadata())
+      val assignment = Utils.readBytes(member.memberAssignment())
+      MemberSummary(member.memberId(), member.clientId(), member.clientHost(), metadata, assignment)
     }.toList
     GroupSummary(metadata.state(), metadata.protocolType(), metadata.protocol(), members)
   }
 
-  def describeConsumerGroup(groupId: String): (Map[TopicPartition, String], Map[String, List[TopicPartition]]) = {
+  case class ConsumerSummary(memberId: String,
+                             clientId: String,
+                             clientHost: String,
+                             assignment: List[TopicPartition])
+
+  def describeConsumerGroup(groupId: String): List[ConsumerSummary] = {
     val group = describeGroup(groupId)
-    try {
-      val membersAndTopicPartitions: Map[String, List[TopicPartition]] = getMembersAndTopicPartitions(group)
-      val owners = getOwners(group)
-      (owners, membersAndTopicPartitions)
-    } catch {
-      case (ex: IllegalArgumentException) =>
-        throw new IllegalArgumentException(s"Group ${groupId} is not a consumer group.")
+    if (group.state == "Dead")
+      return List.empty[ConsumerSummary]
+
+    if (group.protocolType != ConsumerProtocol.PROTOCOL_TYPE)
+      throw new IllegalArgumentException(s"Group ${groupId} with protocol type '${group.protocolType}' is not a valid consumer group")
+
+    if (group.state == "Stable") {
+      group.members.map { member =>
+        val assignment = ConsumerProtocol.deserializeAssignment(ByteBuffer.wrap(member.assignment))
+        new ConsumerSummary(member.memberId, member.clientId, member.clientHost, assignment.partitions().asScala.toList)
+      }
+    } else {
+      List.empty
     }
   }
 
-  def getMembersAndTopicPartitions(group: GroupSummary): Map[String, List[TopicPartition]] = {
-    if (group.protocolType != ConsumerProtocol.PROTOCOL_TYPE)
-      throw new IllegalArgumentException(s"${group} is not a valid GroupSummary")
-
-    group.members.map {
-      case member =>
-        val assignment = ConsumerProtocol.deserializeAssignment(ByteBuffer.wrap(member.assignment))
-        member.memberId -> assignment.partitions().asScala.toList
-    }.toMap
+  def close() {
+    client.close()
   }
 
-  def getOwners(groupSummary: GroupSummary): Map[TopicPartition, String] = {
-    if (groupSummary.protocolType != ConsumerProtocol.PROTOCOL_TYPE)
-      throw new IllegalArgumentException(s"${groupSummary} is not a valid GroupSummary")
-
-    groupSummary.members.flatMap {
-      case member =>
-        val assignment = ConsumerProtocol.deserializeAssignment(ByteBuffer.wrap(member.assignment))
-        val partitions = assignment.partitions().asScala.toList
-        partitions.map {
-          case partition: TopicPartition =>
-            partition -> "%s_%s".format(member.memberId, member.clientHost)
-        }.toMap
-    }.toMap
-  }
 }
 
 object AdminClient {
@@ -220,6 +206,8 @@ object AdminClient {
     create(new AdminConfig(config))
   }
 
+  def create(props: Properties): AdminClient = create(props.asScala.toMap)
+
   def create(props: Map[String, _]): AdminClient = create(new AdminConfig(props))
 
   def create(config: AdminConfig): AdminClient = {
@@ -238,7 +226,6 @@ object AdminClient {
       metrics,
       time,
       "admin",
-      Map[String, String](),
       channelBuilder)
 
     val networkClient = new NetworkClient(

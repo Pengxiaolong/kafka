@@ -17,21 +17,22 @@
 
 package kafka.admin
 
-import joptsimple._
 import java.util.Properties
-import kafka.common.{Topic, AdminCommandFailedException}
-import kafka.utils.CommandLineUtils
-import kafka.utils._
-import kafka.utils.ZkUtils._
-import org.I0Itec.zkclient.exception.ZkNodeExistsException
-import scala.collection._
-import scala.collection.JavaConversions._
-import kafka.log.{Defaults, LogConfig}
+
+import joptsimple._
+import kafka.common.{AdminCommandFailedException, Topic, TopicExistsException}
 import kafka.consumer.{ConsumerConfig, Whitelist}
-import kafka.server.ConfigType
-import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.common.security.JaasUtils
 import kafka.coordinator.GroupCoordinator
+import kafka.log.{Defaults, LogConfig}
+import kafka.server.ConfigType
+import kafka.utils.ZkUtils._
+import kafka.utils._
+import org.I0Itec.zkclient.exception.ZkNodeExistsException
+import org.apache.kafka.common.security.JaasUtils
+import org.apache.kafka.common.utils.Utils
+
+import scala.collection.JavaConversions._
+import scala.collection._
 
 
 object TopicCommand extends Logging {
@@ -50,7 +51,7 @@ object TopicCommand extends Logging {
 
     opts.checkArgs()
 
-    val zkUtils = ZkUtils(opts.options.valueOf(opts.zkConnectOpt), 
+    val zkUtils = ZkUtils(opts.options.valueOf(opts.zkConnectOpt),
                           30000,
                           30000,
                           JaasUtils.isZkSecurityEnabled())
@@ -91,25 +92,31 @@ object TopicCommand extends Logging {
   def createTopic(zkUtils: ZkUtils, opts: TopicCommandOptions) {
     val topic = opts.options.valueOf(opts.topicOpt)
     val configs = parseTopicConfigsToBeAdded(opts)
+    val ifNotExists = if (opts.options.has(opts.ifNotExistsOpt)) true else false
     if (Topic.hasCollisionChars(topic))
       println("WARNING: Due to limitations in metric names, topics with a period ('.') or underscore ('_') could collide. To avoid issues it is best to use either, but not both.")
-    if (opts.options.has(opts.replicaAssignmentOpt)) {
-      val assignment = parseReplicaAssignment(opts.options.valueOf(opts.replicaAssignmentOpt))
-      warnOnMaxMessagesChange(configs, assignment.valuesIterator.next().length)
-      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkUtils, topic, assignment, configs, update = false)
-    } else {
-      CommandLineUtils.checkRequiredArgs(opts.parser, opts.options, opts.partitionsOpt, opts.replicationFactorOpt)
-      val partitions = opts.options.valueOf(opts.partitionsOpt).intValue
-      val replicas = opts.options.valueOf(opts.replicationFactorOpt).intValue
-      warnOnMaxMessagesChange(configs, replicas)
-      AdminUtils.createTopic(zkUtils, topic, partitions, replicas, configs)
+    try {
+      if (opts.options.has(opts.replicaAssignmentOpt)) {
+        val assignment = parseReplicaAssignment(opts.options.valueOf(opts.replicaAssignmentOpt))
+        warnOnMaxMessagesChange(configs, assignment.valuesIterator.next().length)
+        AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkUtils, topic, assignment, configs, update = false)
+      } else {
+        CommandLineUtils.checkRequiredArgs(opts.parser, opts.options, opts.partitionsOpt, opts.replicationFactorOpt)
+        val partitions = opts.options.valueOf(opts.partitionsOpt).intValue
+        val replicas = opts.options.valueOf(opts.replicationFactorOpt).intValue
+        warnOnMaxMessagesChange(configs, replicas)
+        AdminUtils.createTopic(zkUtils, topic, partitions, replicas, configs)
+      }
+      println("Created topic \"%s\".".format(topic))
+    } catch  {
+      case e: TopicExistsException => if (!ifNotExists) throw e
     }
-    println("Created topic \"%s\".".format(topic))
   }
 
   def alterTopic(zkUtils: ZkUtils, opts: TopicCommandOptions) {
     val topics = getTopics(zkUtils, opts)
-    if (topics.length == 0) {
+    val ifExists = if (opts.options.has(opts.ifExistsOpt)) true else false
+    if (topics.length == 0 && !ifExists) {
       throw new IllegalArgumentException("Topic %s does not exist on ZK path %s".format(opts.options.valueOf(opts.topicOpt),
           opts.options.valueOf(opts.zkConnectOpt)))
     }
@@ -155,7 +162,8 @@ object TopicCommand extends Logging {
 
   def deleteTopic(zkUtils: ZkUtils, opts: TopicCommandOptions) {
     val topics = getTopics(zkUtils, opts)
-    if (topics.length == 0) {
+    val ifExists = if (opts.options.has(opts.ifExistsOpt)) true else false
+    if (topics.length == 0 && !ifExists) {
       throw new IllegalArgumentException("Topic %s does not exist on ZK path %s".format(opts.options.valueOf(opts.topicOpt),
           opts.options.valueOf(opts.zkConnectOpt)))
     }
@@ -228,6 +236,10 @@ object TopicCommand extends Logging {
     val props = new Properties
     configsToBeAdded.foreach(pair => props.setProperty(pair(0).trim, pair(1).trim))
     LogConfig.validate(props)
+    if (props.containsKey(LogConfig.MessageFormatVersionProp)) {
+      println(s"WARNING: The configuration ${LogConfig.MessageFormatVersionProp}=${props.getProperty(LogConfig.MessageFormatVersionProp)} is specified. " +
+      s"This configuration will be ignored if the value is on a version newer than the specified inter.broker.protocol.version in the broker.")
+    }
     props
   }
 
@@ -307,10 +319,14 @@ object TopicCommand extends Logging {
                                                             "if set when describing topics, only show partitions whose leader is not available")
     val topicsWithOverridesOpt = parser.accepts("topics-with-overrides",
                                                 "if set when describing topics, only show topics that have overridden configs")
+    val ifExistsOpt = parser.accepts("if-exists",
+                                     "if set when altering or deleting topics, the action will only execute if the topic exists")
+    val ifNotExistsOpt = parser.accepts("if-not-exists",
+                                        "if set when creating topics, the action will only execute if the topic does not already exist")
 
     val options = parser.parse(args : _*)
 
-    val allTopicLevelOpts: Set[OptionSpec[_]] = Set(alterOpt, createOpt, describeOpt, listOpt)
+    val allTopicLevelOpts: Set[OptionSpec[_]] = Set(alterOpt, createOpt, describeOpt, listOpt, deleteOpt)
 
     def checkArgs() {
       // check required args
@@ -332,6 +348,8 @@ object TopicCommand extends Logging {
         allTopicLevelOpts -- Set(describeOpt) + reportUnderReplicatedPartitionsOpt + topicsWithOverridesOpt)
       CommandLineUtils.checkInvalidArgs(parser, options, topicsWithOverridesOpt,
         allTopicLevelOpts -- Set(describeOpt) + reportUnderReplicatedPartitionsOpt + reportUnavailablePartitionsOpt)
+      CommandLineUtils.checkInvalidArgs(parser, options, ifExistsOpt, allTopicLevelOpts -- Set(alterOpt, deleteOpt))
+      CommandLineUtils.checkInvalidArgs(parser, options, ifNotExistsOpt, allTopicLevelOpts -- Set(createOpt))
     }
   }
   def warnOnMaxMessagesChange(configs: Properties, replicas: Integer): Unit = {

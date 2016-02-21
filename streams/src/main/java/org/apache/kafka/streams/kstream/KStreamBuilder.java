@@ -18,14 +18,19 @@
 package org.apache.kafka.streams.kstream;
 
 import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.streams.kstream.internals.KStreamImpl;
+import org.apache.kafka.streams.kstream.internals.KTableImpl;
+import org.apache.kafka.streams.kstream.internals.KTableSource;
+import org.apache.kafka.streams.processor.ProcessorSupplier;
 import org.apache.kafka.streams.processor.TopologyBuilder;
 
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * KStreamBuilder is the class to create KStream instances.
+ * KStreamBuilder is a subclass of {@link TopologyBuilder} that provides the {@link KStream} DSL
+ * for users to specify computational logic and translates the given logic to a processor topology.
  */
 public class KStreamBuilder extends TopologyBuilder {
 
@@ -35,6 +40,7 @@ public class KStreamBuilder extends TopologyBuilder {
         super();
     }
 
+    // TODO: needs updated
     /**
      * Creates a KStream instance for the specified topic.
      * The default deserializers specified in the config are used.
@@ -42,12 +48,8 @@ public class KStreamBuilder extends TopologyBuilder {
      * @param topics          the topic names, if empty default to all the topics in the config
      * @return KStream
      */
-    public <K, V> KStream<K, V> from(String... topics) {
-        String name = newName(KStreamImpl.SOURCE_NAME);
-
-        addSource(name, topics);
-
-        return new KStreamImpl<>(this, name, Collections.singleton(name));
+    public <K, V> KStream<K, V> stream(String... topics) {
+        return stream(null, null, topics);
     }
 
     /**
@@ -60,7 +62,7 @@ public class KStreamBuilder extends TopologyBuilder {
      * @param topics          the topic names, if empty default to all the topics in the config
      * @return KStream
      */
-    public <K, V> KStream<K, V> from(Deserializer<? extends K> keyDeserializer, Deserializer<? extends V> valDeserializer, String... topics) {
+    public <K, V> KStream<K, V> stream(Deserializer<K> keyDeserializer, Deserializer<V> valDeserializer, String... topics) {
         String name = newName(KStreamImpl.SOURCE_NAME);
 
         addSource(name, keyDeserializer, valDeserializer, topics);
@@ -68,6 +70,60 @@ public class KStreamBuilder extends TopologyBuilder {
         return new KStreamImpl<>(this, name, Collections.singleton(name));
     }
 
+    /**
+     * Creates a KTable instance for the specified topic.
+     * The default deserializers specified in the config are used.
+     *
+     * @param topic          the topic name
+     * @return KTable
+     */
+    public <K, V> KTable<K, V> table(String topic) {
+        return table(null, null, null, null, topic);
+    }
+
+    /**
+     * Creates a KTable instance for the specified topic.
+     *
+     * @param keySerializer   key serializer used to send key-value pairs,
+     *                        if not specified the default key serializer defined in the configuration will be used
+     * @param valSerializer   value serializer used to send key-value pairs,
+     *                        if not specified the default value serializer defined in the configuration will be used
+     * @param keyDeserializer key deserializer used to read this source KStream,
+     *                        if not specified the default deserializer defined in the configs will be used
+     * @param valDeserializer value deserializer used to read this source KStream,
+     *                        if not specified the default deserializer defined in the configs will be used
+     * @param topic          the topic name
+     * @return KStream
+     */
+    public <K, V> KTable<K, V> table(Serializer<K> keySerializer, Serializer<V> valSerializer, Deserializer<K> keyDeserializer, Deserializer<V> valDeserializer, String topic) {
+        String source = newName(KStreamImpl.SOURCE_NAME);
+        String name = newName(KTableImpl.SOURCE_NAME);
+
+        addSource(source, keyDeserializer, valDeserializer, topic);
+
+        ProcessorSupplier<K, V> processorSupplier = new KTableSource<>(topic);
+        addProcessor(name, processorSupplier, source);
+
+        return new KTableImpl<>(this, name, processorSupplier, Collections.singleton(source), keySerializer, valSerializer, keyDeserializer, valDeserializer);
+    }
+
+    /**
+     * Creates a new stream by merging the given streams
+     *
+     * @param streams the streams to be merged
+     * @return KStream
+     */
+    public <K, V> KStream<K, V> merge(KStream<K, V>... streams) {
+        return KStreamImpl.merge(this, streams);
+    }
+
+    /**
+     * Create a unique processor name used for translation into the processor topology.
+     * This function is only for internal usage.
+     *
+     * @param prefix Processor name prefix.
+     * @return The unique processor name.
+     */
     public String newName(String prefix) {
         return prefix + String.format("%010d", index.getAndIncrement());
     }

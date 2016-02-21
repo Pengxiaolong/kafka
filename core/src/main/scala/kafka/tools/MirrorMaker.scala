@@ -20,7 +20,7 @@ package kafka.tools
 import java.util
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.{CountDownLatch, TimeUnit}
-import java.util.regex.Pattern
+import java.util.regex.{PatternSyntaxException, Pattern}
 import java.util.{Collections, Properties}
 
 import com.yammer.metrics.core.Gauge
@@ -32,7 +32,7 @@ import kafka.message.MessageAndMetadata
 import kafka.metrics.KafkaMetricsGroup
 import kafka.serializer.DefaultDecoder
 import kafka.utils.{CommandLineUtils, CoreUtils, Logging}
-import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{OffsetAndMetadata, Consumer, ConsumerRecord, KafkaConsumer}
 import org.apache.kafka.clients.producer.internals.ErrorLoggingCallback
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.TopicPartition
@@ -41,6 +41,7 @@ import org.apache.kafka.common.utils.Utils
 import org.apache.kafka.common.errors.WakeupException
 
 import scala.collection.JavaConversions._
+import scala.collection.mutable.HashMap
 import scala.util.control.ControlThrowable
 
 /**
@@ -53,7 +54,7 @@ import scala.util.control.ControlThrowable
  *       1. use new producer with following settings
  *            acks=all
  *            retries=max integer
- *            block.on.buffer.full=true
+ *            max.block.ms=max long
  *            max.in.flight.requests.per.connection=1
  *       2. Consumer Settings
  *            auto.commit.enable=false
@@ -146,7 +147,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         .ofType(classOf[String])
 
       val messageHandlerArgsOpt = parser.accepts("message.handler.args",
-        "Arguments used by custom rebalance listener for mirror maker consumer")
+        "Arguments used by custom message handler for mirror maker.")
         .withRequiredArg()
         .describedAs("Arguments passed to message handler constructor.")
         .ofType(classOf[String])
@@ -191,7 +192,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       val producerProps = Utils.loadProps(options.valueOf(producerConfigOpt))
       // Defaults to no data loss settings.
       maybeSetDefaultProperty(producerProps, ProducerConfig.RETRIES_CONFIG, Int.MaxValue.toString)
-      maybeSetDefaultProperty(producerProps, ProducerConfig.BLOCK_ON_BUFFER_FULL_CONFIG, "true")
+      maybeSetDefaultProperty(producerProps, ProducerConfig.MAX_BLOCK_MS_CONFIG, Long.MaxValue.toString)
       maybeSetDefaultProperty(producerProps, ProducerConfig.ACKS_CONFIG, "all")
       maybeSetDefaultProperty(producerProps, ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "1")
       // Always set producer key and value serializer to ByteArraySerializer.
@@ -335,7 +336,16 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
   def commitOffsets(mirrorMakerConsumer: MirrorMakerBaseConsumer) {
     if (!exitingOnSendFailure) {
       trace("Committing offsets.")
-      mirrorMakerConsumer.commit()
+      try {
+        mirrorMakerConsumer.commit()
+      } catch {
+        case e: WakeupException =>
+          // we only call wakeup() once to close the consumer,
+          // so if we catch it in commit we can safely retry
+          // and re-throw to break the loop
+          mirrorMakerConsumer.commit()
+          throw e
+      }
     } else {
       info("Exiting on send failure, skip committing offsets.")
     }
@@ -375,15 +385,16 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
 
     override def run() {
       info("Starting mirror maker thread " + threadName)
-      mirrorMakerConsumer.init()
       try {
+        mirrorMakerConsumer.init()
+
         // We need the two while loop to make sure when old consumer is used, even there is no message we
         // still commit offset. When new consumer is used, this is handled by poll(timeout).
         while (!exitingOnSendFailure && !shuttingDown) {
           try {
             while (!exitingOnSendFailure && !shuttingDown && mirrorMakerConsumer.hasData) {
               val data = mirrorMakerConsumer.receive()
-              trace("Sending message with value size %d".format(data.value.length))
+              trace("Sending message with value size %d and offset %d".format(data.value.length, data.offset))
               val records = messageHandler.handle(data)
               records.foreach(producer.send)
               maybeFlushAndCommitOffsets()
@@ -403,9 +414,13 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         info("Flushing producer.")
         producer.flush()
         info("Committing consumer offsets.")
-        commitOffsets(mirrorMakerConsumer)
+        try {
+          commitOffsets(mirrorMakerConsumer)
+        } catch {
+          case e: WakeupException => // just ignore
+        }
         info("Shutting down consumer connectors.")
-        mirrorMakerConsumer.stop()
+        // we do not need to call consumer.close() since the consumer has already been interrupted
         mirrorMakerConsumer.cleanup()
         shutdownLatch.countDown()
         info("Mirror maker thread stopped")
@@ -419,6 +434,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
 
     def maybeFlushAndCommitOffsets() {
       if (System.currentTimeMillis() - lastOffsetCommitMs > offsetCommitIntervalMs) {
+        debug("Committing MirrorMaker state automatically.")
         producer.flush()
         commitOffsets(mirrorMakerConsumer)
         lastOffsetCommitMs = System.currentTimeMillis()
@@ -469,7 +485,13 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
 
     override def receive() : BaseConsumerRecord = {
       val messageAndMetadata = iter.next()
-      BaseConsumerRecord(messageAndMetadata.topic, messageAndMetadata.partition, messageAndMetadata.offset, messageAndMetadata.key, messageAndMetadata.message)
+      BaseConsumerRecord(messageAndMetadata.topic,
+                         messageAndMetadata.partition,
+                         messageAndMetadata.offset,
+                         messageAndMetadata.timestamp,
+                         messageAndMetadata.timestampType,
+                         messageAndMetadata.key,
+                         messageAndMetadata.message)
     }
 
     override def stop() {
@@ -492,22 +514,46 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     val regex = whitelistOpt.getOrElse(throw new IllegalArgumentException("New consumer only supports whitelist."))
     var recordIter: java.util.Iterator[ConsumerRecord[Array[Byte], Array[Byte]]] = null
 
+    // TODO: we need to manually maintain the consumed offsets for new consumer
+    // since its internal consumed position is updated in batch rather than one
+    // record at a time, this can be resolved when we break the unification of both consumers
+    private val offsets = new HashMap[TopicPartition, Long]()
+
     override def init() {
       debug("Initiating new consumer")
       val consumerRebalanceListener = new InternalRebalanceListenerForNewConsumer(this, customRebalanceListener)
-      if (whitelistOpt.isDefined)
-        consumer.subscribe(Pattern.compile(whitelistOpt.get), consumerRebalanceListener)
+      if (whitelistOpt.isDefined) {
+        try {
+          consumer.subscribe(Pattern.compile(whitelistOpt.get), consumerRebalanceListener)
+        } catch {
+          case pse: PatternSyntaxException =>
+            error("Invalid expression syntax: %s".format(whitelistOpt.get))
+            throw pse
+        }
+      }
     }
 
-    // New consumer always hasNext
     override def hasData = true
 
     override def receive() : BaseConsumerRecord = {
-      while (recordIter == null || !recordIter.hasNext)
+      if (recordIter == null || !recordIter.hasNext) {
         recordIter = consumer.poll(1000).iterator
+        if (!recordIter.hasNext)
+          throw new ConsumerTimeoutException
+      }
 
       val record = recordIter.next()
-      BaseConsumerRecord(record.topic, record.partition, record.offset, record.key, record.value)
+      val tp = new TopicPartition(record.topic, record.partition)
+
+      offsets.put(tp, record.offset + 1)
+
+      BaseConsumerRecord(record.topic,
+                         record.partition,
+                         record.offset,
+                         record.timestamp,
+                         record.timestampType,
+                         record.key,
+                         record.value)
     }
 
     override def stop() {
@@ -519,7 +565,8 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     }
 
     override def commit() {
-      consumer.commitSync()
+      consumer.commitSync(offsets.map { case (tp, offset) =>  (tp, new OffsetAndMetadata(offset, ""))})
+      offsets.clear()
     }
   }
 
@@ -530,7 +577,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     override def onPartitionsRevoked(partitions: util.Collection[TopicPartition]) {
       producer.flush()
       commitOffsets(mirrorMakerConsumer)
-      customRebalanceListenerForNewConsumer.foreach(_.onPartitionsAssigned(partitions))
+      customRebalanceListenerForNewConsumer.foreach(_.onPartitionsRevoked(partitions))
     }
 
     override def onPartitionsAssigned(partitions: util.Collection[TopicPartition]) {
@@ -606,15 +653,10 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
    * If message.handler.args is specified. A constructor that takes in a String as argument must exist.
    */
   trait MirrorMakerMessageHandler {
-    def handle(record: MessageAndMetadata[Array[Byte], Array[Byte]]): util.List[ProducerRecord[Array[Byte], Array[Byte]]]
     def handle(record: BaseConsumerRecord): util.List[ProducerRecord[Array[Byte], Array[Byte]]]
   }
 
   private object defaultMirrorMakerMessageHandler extends MirrorMakerMessageHandler {
-    override def handle(record: MessageAndMetadata[Array[Byte], Array[Byte]]): util.List[ProducerRecord[Array[Byte], Array[Byte]]] = {
-      Collections.singletonList(new ProducerRecord[Array[Byte], Array[Byte]](record.topic, record.key(), record.message()))
-    }
-
     override def handle(record: BaseConsumerRecord): util.List[ProducerRecord[Array[Byte], Array[Byte]]] = {
       Collections.singletonList(new ProducerRecord[Array[Byte], Array[Byte]](record.topic, record.key, record.value))
     }

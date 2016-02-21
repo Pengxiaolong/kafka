@@ -29,10 +29,16 @@ import java.util.ArrayList;
 public class MockStateStoreSupplier implements StateStoreSupplier {
     private final String name;
     private final boolean persistent;
+    private final boolean loggingEnabled;
 
     public MockStateStoreSupplier(String name, boolean persistent) {
+        this(name, persistent, true);
+    }
+
+    public MockStateStoreSupplier(String name, boolean persistent, boolean loggingEnabled) {
         this.name = name;
         this.persistent = persistent;
+        this.loggingEnabled = loggingEnabled;
     }
 
     @Override
@@ -42,13 +48,18 @@ public class MockStateStoreSupplier implements StateStoreSupplier {
 
     @Override
     public StateStore get() {
-        return new MockStateStore(name, persistent);
+        if (loggingEnabled) {
+            return new MockStateStore(name, persistent).enableLogging();
+        } else {
+            return new MockStateStore(name, persistent);
+        }
     }
 
     public static class MockStateStore implements StateStore {
         private final String name;
         private final boolean persistent;
 
+        public boolean loggingEnabled = false;
         public boolean initialized = false;
         public boolean flushed = false;
         public boolean closed = false;
@@ -59,14 +70,19 @@ public class MockStateStoreSupplier implements StateStoreSupplier {
             this.persistent = persistent;
         }
 
+        public MockStateStore enableLogging() {
+            loggingEnabled = true;
+            return this;
+        }
+
         @Override
         public String name() {
             return name;
         }
 
         @Override
-        public void init(ProcessorContext context) {
-            context.register(this, stateRestoreCallback);
+        public void init(ProcessorContext context, StateStore root) {
+            context.register(root, loggingEnabled, stateRestoreCallback);
             initialized = true;
         }
 

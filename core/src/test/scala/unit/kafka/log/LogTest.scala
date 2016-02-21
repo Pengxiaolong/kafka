@@ -5,7 +5,7 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- * 
+ *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -20,33 +20,34 @@ package kafka.log
 import java.io._
 import java.util.Properties
 import java.util.concurrent.atomic._
+import org.apache.kafka.common.errors.{OffsetOutOfRangeException, RecordBatchTooLargeException, RecordTooLargeException, CorruptRecordException}
+import kafka.api.ApiVersion
 import org.junit.Assert._
 import org.scalatest.junit.JUnitSuite
 import org.junit.{After, Before, Test}
 import kafka.message._
-import kafka.common.{MessageSizeTooLargeException, OffsetOutOfRangeException, MessageSetSizeTooLargeException}
 import kafka.utils._
 import kafka.server.KafkaConfig
 
 class LogTest extends JUnitSuite {
-  
-  var logDir: File = null
+
+  val tmpDir = TestUtils.tempDir()
+  val logDir = TestUtils.randomPartitionLogDir(tmpDir)
   val time = new MockTime(0)
   var config: KafkaConfig = null
-  val logConfig = LogConfig()  
+  val logConfig = LogConfig()
 
   @Before
   def setUp() {
-    logDir = TestUtils.tempDir()
     val props = TestUtils.createBrokerConfig(0, "127.0.0.1:1", port = -1)
     config = KafkaConfig.fromProps(props)
   }
 
   @After
   def tearDown() {
-    CoreUtils.rm(logDir)
+    CoreUtils.rm(tmpDir)
   }
-  
+
   def createEmptyLogs(dir: File, offsets: Int*) {
     for(offset <- offsets) {
       Log.logFilename(dir, offset).createNewFile()
@@ -132,6 +133,8 @@ class LogTest extends JUnitSuite {
 
     val logProps = new Properties()
     logProps.put(LogConfig.SegmentBytesProp, segmentSize: java.lang.Integer)
+    // We use need to use magic value 1 here because the test is message size sensitive.
+    logProps.put(LogConfig.MessageFormatVersionProp, ApiVersion.latestVersion.toString())
     // create a log
     val log = new Log(logDir, LogConfig(logProps), recoveryPoint = 0L, time.scheduler, time = time)
     assertEquals("There should be exactly 1 segment.", 1, log.numberOfSegments)
@@ -160,6 +163,8 @@ class LogTest extends JUnitSuite {
   def testAppendAndReadWithSequentialOffsets() {
     val logProps = new Properties()
     logProps.put(LogConfig.SegmentBytesProp, 71: java.lang.Integer)
+    // We use need to use magic value 1 here because the test is message size sensitive.
+    logProps.put(LogConfig.MessageFormatVersionProp, ApiVersion.latestVersion.toString())
     val log = new Log(logDir, LogConfig(logProps), recoveryPoint = 0L, time.scheduler, time = time)
     val messages = (0 until 100 by 2).map(id => new Message(id.toString.getBytes)).toArray
 
@@ -264,7 +269,8 @@ class LogTest extends JUnitSuite {
     for(i <- 0 until numMessages) {
       val messages = log.read(offset, 1024*1024).messageSet
       assertEquals("Offsets not equal", offset, messages.head.offset)
-      assertEquals("Messages not equal at offset " + offset, messageSets(i).head.message, messages.head.message)
+      assertEquals("Messages not equal at offset " + offset, messageSets(i).head.message,
+        messages.head.message.toFormatVersion(messageSets(i).head.message.magic))
       offset = messages.head.offset + 1
     }
     val lastRead = log.read(startOffset = numMessages, maxLength = 1024*1024, maxOffset = Some(numMessages + 1)).messageSet
@@ -290,7 +296,7 @@ class LogTest extends JUnitSuite {
     log.append(new ByteBufferMessageSet(DefaultCompressionCodec, new Message("hello".getBytes), new Message("there".getBytes)))
     log.append(new ByteBufferMessageSet(DefaultCompressionCodec, new Message("alpha".getBytes), new Message("beta".getBytes)))
 
-    def read(offset: Int) = ByteBufferMessageSet.deepIterator(log.read(offset, 4096).messageSet.head.message)
+    def read(offset: Int) = ByteBufferMessageSet.deepIterator(log.read(offset, 4096).messageSet.head)
 
     /* we should always get the first message in the compressed set when reading any offset in the set */
     assertEquals("Read at offset 0 should produce 0", 0, read(0).next().offset)
@@ -343,20 +349,22 @@ class LogTest extends JUnitSuite {
     val configSegmentSize = messageSet.sizeInBytes - 1
     val logProps = new Properties()
     logProps.put(LogConfig.SegmentBytesProp, configSegmentSize: java.lang.Integer)
+    // We use need to use magic value 1 here because the test is message size sensitive.
+    logProps.put(LogConfig.MessageFormatVersionProp, ApiVersion.latestVersion.toString())
     val log = new Log(logDir, LogConfig(logProps), recoveryPoint = 0L, time.scheduler, time = time)
 
     try {
       log.append(messageSet)
-      fail("message set should throw MessageSetSizeTooLargeException.")
+      fail("message set should throw RecordBatchTooLargeException.")
     } catch {
-      case e: MessageSetSizeTooLargeException => // this is good
+      case e: RecordBatchTooLargeException => // this is good
     }
   }
 
   @Test
   def testCompactedTopicConstraints() {
-    val keyedMessage = new Message(bytes = "this message has a key".getBytes, key = "and here it is".getBytes)
-    val anotherKeyedMessage = new Message(bytes = "this message also has a key".getBytes, key ="another key".getBytes)
+    val keyedMessage = new Message(bytes = "this message has a key".getBytes, key = "and here it is".getBytes, Message.NoTimestamp, Message.CurrentMagicValue)
+    val anotherKeyedMessage = new Message(bytes = "this message also has a key".getBytes, key ="another key".getBytes, Message.NoTimestamp, Message.CurrentMagicValue)
     val unkeyedMessage = new Message(bytes = "this message does not have a key".getBytes)
 
     val messageSetWithUnkeyedMessage = new ByteBufferMessageSet(NoCompressionCodec, unkeyedMessage, keyedMessage)
@@ -376,19 +384,19 @@ class LogTest extends JUnitSuite {
       log.append(messageSetWithUnkeyedMessage)
       fail("Compacted topics cannot accept a message without a key.")
     } catch {
-      case e: InvalidMessageException => // this is good
+      case e: CorruptRecordException => // this is good
     }
     try {
       log.append(messageSetWithOneUnkeyedMessage)
       fail("Compacted topics cannot accept a message without a key.")
     } catch {
-      case e: InvalidMessageException => // this is good
+      case e: CorruptRecordException => // this is good
     }
     try {
       log.append(messageSetWithCompressedUnkeyedMessage)
       fail("Compacted topics cannot accept a message without a key.")
     } catch {
-      case e: InvalidMessageException => // this is good
+      case e: CorruptRecordException => // this is good
     }
 
     // the following should succeed without any InvalidMessageException
@@ -404,7 +412,7 @@ class LogTest extends JUnitSuite {
   @Test
   def testMessageSizeCheck() {
     val first = new ByteBufferMessageSet(NoCompressionCodec, new Message ("You".getBytes), new Message("bethe".getBytes))
-    val second = new ByteBufferMessageSet(NoCompressionCodec, new Message("change".getBytes))
+    val second = new ByteBufferMessageSet(NoCompressionCodec, new Message("change (I need more bytes)".getBytes))
 
     // append messages to log
     val maxMessageSize = second.sizeInBytes - 1
@@ -419,7 +427,7 @@ class LogTest extends JUnitSuite {
       log.append(second)
       fail("Second message set should throw MessageSizeTooLargeException.")
     } catch {
-      case e: MessageSizeTooLargeException => // this is good
+      case e: RecordTooLargeException => // this is good
     }
   }
   /**
