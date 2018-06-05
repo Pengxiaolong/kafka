@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -31,6 +31,8 @@ import org.apache.kafka.common.Configurable;
  * just log the errors.
  * <p>
  * ProducerInterceptor callbacks may be called from multiple threads. Interceptor implementation must ensure thread-safety, if needed.
+ * <p>
+ * Implement {@link org.apache.kafka.common.ClusterResourceListener} to receive cluster metadata once it's available. Please see the class documentation for ClusterResourceListener for more information.
  */
 public interface ProducerInterceptor<K, V> extends Configurable {
     /**
@@ -76,7 +78,12 @@ public interface ProducerInterceptor<K, V> extends Configurable {
      * This method will generally execute in the background I/O thread, so the implementation should be reasonably fast.
      * Otherwise, sending of messages from other threads could be delayed.
      *
-     * @param metadata The metadata for the record that was sent (i.e. the partition and offset). Null if an error occurred.
+     * @param metadata The metadata for the record that was sent (i.e. the partition and offset).
+     *                 If an error occurred, metadata will contain only valid topic and maybe
+     *                 partition. If partition is not given in ProducerRecord and an error occurs
+     *                 before partition gets assigned, then partition will be set to RecordMetadata.NO_PARTITION.
+     *                 The metadata may be null if the client passed null record to
+     *                 {@link org.apache.kafka.clients.producer.KafkaProducer#send(ProducerRecord)}.
      * @param exception The exception thrown during processing of this record. Null if no error occurred.
      */
     public void onAcknowledgement(RecordMetadata metadata, Exception exception);

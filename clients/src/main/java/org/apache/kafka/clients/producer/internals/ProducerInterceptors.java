@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -20,6 +20,8 @@ package org.apache.kafka.clients.producer.internals;
 import org.apache.kafka.clients.producer.ProducerInterceptor;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.RecordBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -76,13 +78,44 @@ public class ProducerInterceptors<K, V> implements Closeable {
      *
      * This method does not throw exceptions. Exceptions thrown by any of interceptor methods are caught and ignored.
      *
-     * @param metadata The metadata for the record that was sent (i.e. the partition and offset). Null if an error occurred.
+     * @param metadata The metadata for the record that was sent (i.e. the partition and offset).
+     *                 If an error occurred, metadata will only contain valid topic and maybe partition.
      * @param exception The exception thrown during processing of this record. Null if no error occurred.
      */
     public void onAcknowledgement(RecordMetadata metadata, Exception exception) {
         for (ProducerInterceptor<K, V> interceptor : this.interceptors) {
             try {
                 interceptor.onAcknowledgement(metadata, exception);
+            } catch (Exception e) {
+                // do not propagate interceptor exceptions, just log
+                log.warn("Error executing interceptor onAcknowledgement callback", e);
+            }
+        }
+    }
+
+    /**
+     * This method is called when sending the record fails in {@link ProducerInterceptor#onSend
+     * (ProducerRecord)} method. This method calls {@link ProducerInterceptor#onAcknowledgement(RecordMetadata, Exception)}
+     * method for each interceptor
+     *
+     * @param record The record from client
+     * @param interceptTopicPartition  The topic/partition for the record if an error occurred
+     *        after partition gets assigned; the topic part of interceptTopicPartition is the same as in record.
+     * @param exception The exception thrown during processing of this record.
+     */
+    public void onSendError(ProducerRecord<K, V> record, TopicPartition interceptTopicPartition, Exception exception) {
+        for (ProducerInterceptor<K, V> interceptor : this.interceptors) {
+            try {
+                if (record == null && interceptTopicPartition == null) {
+                    interceptor.onAcknowledgement(null, exception);
+                } else {
+                    if (interceptTopicPartition == null) {
+                        interceptTopicPartition = new TopicPartition(record.topic(),
+                                record.partition() == null ? RecordMetadata.UNKNOWN_PARTITION : record.partition());
+                    }
+                    interceptor.onAcknowledgement(new RecordMetadata(interceptTopicPartition, -1, -1,
+                                    RecordBatch.NO_TIMESTAMP, Long.valueOf(-1L), -1, -1), exception);
+                }
             } catch (Exception e) {
                 // do not propagate interceptor exceptions, just log
                 log.warn("Error executing interceptor onAcknowledgement callback", e);

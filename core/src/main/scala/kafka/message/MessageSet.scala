@@ -18,7 +18,8 @@
 package kafka.message
 
 import java.nio._
-import java.nio.channels._
+
+import org.apache.kafka.common.record.Records
 
 /**
  * Message set helper functions
@@ -37,30 +38,16 @@ object MessageSet {
     messages.foldLeft(0)(_ + entrySize(_))
 
   /**
-   * The size of a list of messages
-   */
-  def messageSetSize(messages: java.util.List[Message]): Int = {
-    var size = 0
-    val iter = messages.iterator
-    while(iter.hasNext) {
-      val message = iter.next
-      size += entrySize(message)
-    }
-    size
-  }
-  
-  /**
    * The size of a size-delimited entry in a message set
    */
   def entrySize(message: Message): Int = LogOverhead + message.size
 
   /**
-   * Validate the "magic" values of messages are the same in a compressed message set and return the magic value of
-   * and the max timestamp of the inner messages.
+   * Validate that all "magic" values in `messages` are the same and return their magic value and max timestamp
    */
   def magicAndLargestTimestamp(messages: Seq[Message]): MagicAndTimestamp = {
     val firstMagicValue = messages.head.magic
-    var largestTimestamp: Long = Message.NoTimestamp
+    var largestTimestamp = Message.NoTimestamp
     for (message <- messages) {
       if (message.magic != firstMagicValue)
         throw new IllegalStateException("Messages in the same message set must have same magic value")
@@ -84,16 +71,6 @@ case class MagicAndTimestamp(magic: Byte, timestamp: Long)
  */
 abstract class MessageSet extends Iterable[MessageAndOffset] {
 
-  /** Write the messages in this set to the given channel starting at the given offset byte. 
-    * Less than the complete amount may be written, but no more than maxSize can be. The number
-    * of bytes written is returned */
-  def writeTo(channel: GatheringByteChannel, offset: Long, maxSize: Int): Int
-
-  /**
-   * Check if all the wrapper messages in the message set have the expected magic value
-   */
-  def magicValueInAllWrapperMessages(expectedMagicValue: Byte): Boolean
-
   /**
    * Provides an iterator over the message/offset pairs in this set
    */
@@ -105,13 +82,18 @@ abstract class MessageSet extends Iterable[MessageAndOffset] {
   def sizeInBytes: Int
 
   /**
+   * Get the client representation of the message set
+   */
+  def asRecords: Records
+
+  /**
    * Print this message set's contents. If the message set has more than 100 messages, just
    * print the first 100.
    */
   override def toString: String = {
     val builder = new StringBuilder()
     builder.append(getClass.getSimpleName + "(")
-    val iter = this.iterator
+    val iter = this.asRecords.batches.iterator
     var i = 0
     while(iter.hasNext && i < 100) {
       val message = iter.next

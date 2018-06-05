@@ -17,19 +17,25 @@
 
 package kafka.consumer
 
-import java.util.Properties
+import java.util.{Collections, Properties}
 import java.util.regex.Pattern
 
+import kafka.api.OffsetRequest
 import kafka.common.StreamEndException
 import kafka.message.Message
-import org.apache.kafka.clients.consumer.internals.NoOpConsumerRebalanceListener
+import org.apache.kafka.clients.consumer.Consumer
 import org.apache.kafka.common.record.TimestampType
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.header.Headers
+import org.apache.kafka.common.header.internals.RecordHeaders
 
 /**
  * A base consumer used to abstract both old and new consumer
- * this class should be removed (along with BaseProducer) be removed
+ * this class should be removed (along with BaseProducer)
  * once we deprecate old consumer
  */
+@deprecated("This trait has been deprecated and will be removed in a future release. " +
+            "Please use org.apache.kafka.clients.consumer.KafkaConsumer instead.", "0.11.0.0")
 trait BaseConsumer {
   def receive(): BaseConsumerRecord
   def stop()
@@ -37,28 +43,63 @@ trait BaseConsumer {
   def commit()
 }
 
+@deprecated("This class has been deprecated and will be removed in a future release. " +
+            "Please use org.apache.kafka.clients.consumer.ConsumerRecord instead.", "0.11.0.0")
 case class BaseConsumerRecord(topic: String,
                               partition: Int,
                               offset: Long,
                               timestamp: Long = Message.NoTimestamp,
                               timestampType: TimestampType = TimestampType.NO_TIMESTAMP_TYPE,
                               key: Array[Byte],
-                              value: Array[Byte])
+                              value: Array[Byte],
+                              headers: Headers = new RecordHeaders())
 
-class NewShinyConsumer(topic: Option[String], whitelist: Option[String], consumerProps: Properties, val timeoutMs: Long = Long.MaxValue) extends BaseConsumer {
-  import org.apache.kafka.clients.consumer.KafkaConsumer
-
-  import scala.collection.JavaConversions._
-
-  val consumer = new KafkaConsumer[Array[Byte], Array[Byte]](consumerProps)
-  if (topic.isDefined)
-    consumer.subscribe(List(topic.get))
-  else if (whitelist.isDefined)
-    consumer.subscribe(Pattern.compile(whitelist.get), new NoOpConsumerRebalanceListener())
-  else
-    throw new IllegalArgumentException("Exactly one of topic or whitelist has to be provided.")
-
+@deprecated("This class has been deprecated and will be removed in a future release. " +
+            "Please use org.apache.kafka.clients.consumer.KafkaConsumer instead.", "0.11.0.0")
+class NewShinyConsumer(topic: Option[String], partitionId: Option[Int], offset: Option[Long], whitelist: Option[String],
+                       consumer: Consumer[Array[Byte], Array[Byte]], val timeoutMs: Long = Long.MaxValue) extends BaseConsumer {
+  consumerInit()
   var recordIter = consumer.poll(0).iterator
+
+  def consumerInit() {
+    (topic, partitionId, offset, whitelist) match {
+      case (Some(topic), Some(partitionId), Some(offset), None) =>
+        seek(topic, partitionId, offset)
+      case (Some(topic), Some(partitionId), None, None) =>
+        // default to latest if no offset is provided
+        seek(topic, partitionId, OffsetRequest.LatestTime)
+      case (Some(topic), None, None, None) =>
+        consumer.subscribe(Collections.singletonList(topic))
+      case (None, None, None, Some(whitelist)) =>
+        consumer.subscribe(Pattern.compile(whitelist))
+      case _ =>
+        throw new IllegalArgumentException("An invalid combination of arguments is provided. " +
+            "Exactly one of 'topic' or 'whitelist' must be provided. " +
+            "If 'topic' is provided, an optional 'partition' may also be provided. " +
+            "If 'partition' is provided, an optional 'offset' may also be provided, otherwise, consumption starts from the end of the partition.")
+    }
+  }
+
+  def seek(topic: String, partitionId: Int, offset: Long) {
+    val topicPartition = new TopicPartition(topic, partitionId)
+    consumer.assign(Collections.singletonList(topicPartition))
+    offset match {
+      case OffsetRequest.EarliestTime => consumer.seekToBeginning(Collections.singletonList(topicPartition))
+      case OffsetRequest.LatestTime => consumer.seekToEnd(Collections.singletonList(topicPartition))
+      case _ => consumer.seek(topicPartition, offset)
+    }
+  }
+
+  def resetUnconsumedOffsets() {
+    val smallestUnconsumedOffsets = collection.mutable.Map[TopicPartition, Long]()
+    while (recordIter.hasNext) {
+      val record = recordIter.next()
+      val tp = new TopicPartition(record.topic, record.partition)
+      // avoid auto-committing offsets which haven't been consumed
+      smallestUnconsumedOffsets.getOrElseUpdate(tp, record.offset)
+    }
+    smallestUnconsumedOffsets.foreach { case (tp, offset) => consumer.seek(tp, offset) }
+  }
 
   override def receive(): BaseConsumerRecord = {
     if (!recordIter.hasNext) {
@@ -74,7 +115,8 @@ class NewShinyConsumer(topic: Option[String], whitelist: Option[String], consume
                        record.timestamp,
                        record.timestampType,
                        record.key,
-                       record.value)
+                       record.value,
+                       record.headers)
   }
 
   override def stop() {
@@ -82,6 +124,7 @@ class NewShinyConsumer(topic: Option[String], whitelist: Option[String], consume
   }
 
   override def cleanup() {
+    resetUnconsumedOffsets()
     this.consumer.close()
   }
 
@@ -90,6 +133,8 @@ class NewShinyConsumer(topic: Option[String], whitelist: Option[String], consume
   }
 }
 
+@deprecated("This class has been deprecated and will be removed in a future release. " +
+            "Please use org.apache.kafka.clients.consumer.KafkaConsumer instead.", "0.11.0.0")
 class OldConsumer(topicFilter: TopicFilter, consumerProps: Properties) extends BaseConsumer {
   import kafka.serializer.DefaultDecoder
 
@@ -109,7 +154,8 @@ class OldConsumer(topicFilter: TopicFilter, consumerProps: Properties) extends B
                        messageAndMetadata.timestamp,
                        messageAndMetadata.timestampType,
                        messageAndMetadata.key,
-                       messageAndMetadata.message)
+                       messageAndMetadata.message, 
+                       new RecordHeaders())
   }
 
   override def stop() {
@@ -124,4 +170,3 @@ class OldConsumer(topicFilter: TopicFilter, consumerProps: Properties) extends B
     this.consumerConnector.commitOffsets
   }
 }
-

@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -14,51 +14,46 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.kafka.streams.kstream.internals;
 
-import org.apache.kafka.streams.kstream.ValueTransformer;
-import org.apache.kafka.streams.kstream.ValueTransformerSupplier;
+import org.apache.kafka.streams.kstream.ValueTransformerWithKey;
+import org.apache.kafka.streams.kstream.ValueTransformerWithKeySupplier;
 import org.apache.kafka.streams.processor.Processor;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.ProcessorSupplier;
+import org.apache.kafka.streams.processor.internals.ForwardingDisabledProcessorContext;
 
 public class KStreamTransformValues<K, V, R> implements ProcessorSupplier<K, V> {
 
-    private final ValueTransformerSupplier<V, R> valueTransformerSupplier;
+    private final ValueTransformerWithKeySupplier<K, V, R> valueTransformerSupplier;
 
-    public KStreamTransformValues(ValueTransformerSupplier valueTransformerSupplier) {
+    KStreamTransformValues(final ValueTransformerWithKeySupplier<K, V, R> valueTransformerSupplier) {
         this.valueTransformerSupplier = valueTransformerSupplier;
     }
 
     @Override
     public Processor<K, V> get() {
-        return new KStreamTransformValuesProcessor(valueTransformerSupplier.get());
+        return new KStreamTransformValuesProcessor<>(valueTransformerSupplier.get());
     }
 
     public static class KStreamTransformValuesProcessor<K, V, R> implements Processor<K, V> {
 
-        private final ValueTransformer valueTransformer;
+        private final ValueTransformerWithKey<K, V, R> valueTransformer;
         private ProcessorContext context;
 
-        public KStreamTransformValuesProcessor(ValueTransformer<V, R> valueTransformer) {
+        KStreamTransformValuesProcessor(final ValueTransformerWithKey<K, V, R> valueTransformer) {
             this.valueTransformer = valueTransformer;
         }
 
         @Override
-        public void init(ProcessorContext context) {
-            valueTransformer.init(context);
+        public void init(final ProcessorContext context) {
+            valueTransformer.init(new ForwardingDisabledProcessorContext(context));
             this.context = context;
         }
 
         @Override
         public void process(K key, V value) {
-            context.forward(key, valueTransformer.transform(value));
-        }
-
-        @Override
-        public void punctuate(long timestamp) {
-            valueTransformer.punctuate(timestamp);
+            context.forward(key, valueTransformer.transform(key, value));
         }
 
         @Override

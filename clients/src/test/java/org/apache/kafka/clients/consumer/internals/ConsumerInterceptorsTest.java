@@ -1,10 +1,10 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
+ * contributor license agreements. See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * the License. You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -44,7 +44,7 @@ public class ConsumerInterceptorsTest {
     private final TopicPartition filterTopicPart1 = new TopicPartition("test5", filterPartition1);
     private final TopicPartition filterTopicPart2 = new TopicPartition("test6", filterPartition2);
     private final ConsumerRecord<Integer, Integer> consumerRecord =
-        new ConsumerRecord<>(topic, partition, 0, 0L, TimestampType.CREATE_TIME, 1, 1);
+        new ConsumerRecord<>(topic, partition, 0, 0L, TimestampType.CREATE_TIME, 0L, 0, 0, 1, 1);
     private int onCommitCount = 0;
     private int onConsumeCount = 0;
 
@@ -117,9 +117,11 @@ public class ConsumerInterceptorsTest {
         List<ConsumerRecord<Integer, Integer>> list1 = new ArrayList<>();
         list1.add(consumerRecord);
         List<ConsumerRecord<Integer, Integer>> list2 = new ArrayList<>();
-        list2.add(new ConsumerRecord<>(filterTopicPart1.topic(), filterTopicPart1.partition(), 0, 0L, TimestampType.CREATE_TIME, 1, 1));
+        list2.add(new ConsumerRecord<>(filterTopicPart1.topic(), filterTopicPart1.partition(), 0,
+                                       0L, TimestampType.CREATE_TIME, 0L, 0, 0, 1, 1));
         List<ConsumerRecord<Integer, Integer>> list3 = new ArrayList<>();
-        list3.add(new ConsumerRecord<>(filterTopicPart2.topic(), filterTopicPart2.partition(), 0, 0L, TimestampType.CREATE_TIME, 1, 1));
+        list3.add(new ConsumerRecord<>(filterTopicPart2.topic(), filterTopicPart2.partition(), 0,
+                                       0L, TimestampType.CREATE_TIME, 0L, 0, 0, 1, 1));
         records.put(tp, list1);
         records.put(filterTopicPart1, list2);
         records.put(filterTopicPart2, list3);
